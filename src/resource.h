@@ -11,6 +11,13 @@
  * + the few textures we decode), not a full load. NULL on failure. */
 unsigned char *res_map_file(const char *path, long *len);
 void res_unmap_file(unsigned char *data, long len);
+/* Optional phase snapshots to OPENUG2_MEMORY_LOG. Linux process/system values
+ * are sampled from /proc; byte estimates describe owners, not allocator totals. */
+size_t res_scene_bytes(const N2Scene *scene);
+void res_memory_log(const char *phase, size_t geometry, size_t sources, size_t textures);
+/* Loading/retirement boundary only: return freed glibc arena pages to Linux.
+ * Other allocators/platforms keep their normal policy. Never call per frame. */
+void res_trim_heap(void);
 
 /* Enumerate selectable tracks: STREAM*.BUN files under troot. Writes up to
  * max names (extension stripped) and sets *sel to the entry matching cur.

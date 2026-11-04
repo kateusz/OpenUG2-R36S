@@ -5,6 +5,9 @@
 #include <dirent.h>
 #include <limits.h>
 #include <stdint.h>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -67,6 +70,57 @@ void res_unmap_file(unsigned char *data, long len) {
     if (data && len > 0) UnmapViewOfFile(data);
 #else
     if (data && len > 0) munmap(data, (size_t)len);
+#endif
+}
+
+size_t res_scene_bytes(const N2Scene *scene) {
+    if (!scene) return 0;
+    size_t bytes = (size_t)scene->cap * sizeof *scene->meshes;
+    for (int i = 0; i < scene->count; i++) {
+        const N2Mesh *m = &scene->meshes[i];
+        bytes += (size_t)m->nverts * (5 * sizeof(float) + (m->vcol ? 4 : 0));
+        bytes += (size_t)m->nidx * sizeof(uint16_t);
+        bytes += (size_t)m->wall_nverts * 5 * sizeof(float);
+        bytes += (size_t)m->wall_nidx * sizeof(uint16_t);
+    }
+    return bytes;
+}
+
+void res_memory_log(const char *phase, size_t geometry, size_t sources, size_t textures) {
+    const char *path = getenv("OPENUG2_MEMORY_LOG");
+    if (!path || !*path) return;
+    unsigned long rss=0, anon=0, file=0, available=0;
+    double uptime=0;
+#ifndef _WIN32
+    FILE *f = fopen("/proc/self/status", "r");
+    char line[256];
+    while (f && fgets(line, sizeof line, f)) {
+        (void)sscanf(line, "VmRSS: %lu", &rss);
+        (void)sscanf(line, "RssAnon: %lu", &anon);
+        (void)sscanf(line, "RssFile: %lu", &file);
+    }
+    if (f) fclose(f);
+    f = fopen("/proc/meminfo", "r");
+    while (f && fgets(line, sizeof line, f))
+        (void)sscanf(line, "MemAvailable: %lu", &available);
+    if (f) fclose(f);
+    f = fopen("/proc/uptime", "r");
+    if (f) { (void)fscanf(f, "%lf", &uptime); fclose(f); }
+#endif
+    FILE *out = fopen(path, "a");
+    if (!out) return;
+    if (ftell(out) == 0)
+        fputs("phase,uptime_s,rss_kib,anon_kib,file_kib,available_kib,geometry_bytes,source_bytes,texture_estimate_bytes\n", out);
+    fprintf(out, "%s,%.3f,%lu,%lu,%lu,%lu,%zu,%zu,%zu\n", phase, uptime,
+            rss, anon, file, available, geometry, sources, textures);
+    fclose(out); /* every phase survives a later process kill */
+}
+
+void res_trim_heap(void) {
+#ifdef __GLIBC__
+    res_memory_log("heap.trim.before",0,0,0);
+    (void)malloc_trim(0);
+    res_memory_log("heap.trim.after",0,0,0);
 #endif
 }
 

@@ -61,6 +61,41 @@ static void write_tpk(const char *path, uint32_t key, int green) {
     write_tpk_record(f,key,green);assert(!fclose(f));
 }
 
+/* A transition borrows shared images twice. Eviction must preserve either
+ * live owner, and cancellation must release the successfully bound prefix. */
+static void test_cache_borrowers(const char *path) {
+    World w[2] = {0}; WTextureBind binding[2] = {0};
+    uint32_t keys[2][2] = {{0}}; RhiTexture tex[2][2] = {{{0}}};
+    N2Mesh mesh = {.texkey=KEY};
+    for (int i=0;i<2;i++) {
+        w[i].neighborhood.nreg=1;
+        WRegion *r=&w[i].neighborhood.rgn[0];
+        r->data=n2_read_file(path,&r->len); assert(r->data);
+        r->tpk=n2_tpk_open(r->data,r->len); r->mesh1=1;
+        w[i].neighborhood.scene=(N2Scene){&mesh,1,1};
+        while (!world_bind_textures_step(&w[i],keys[i],tex[i],NULL,2,&binding[i],1)) {}
+        assert(binding[i].acquired==1 && binding[i].count==1);
+    }
+    RhiTexture shared=tex[0][0]; assert(shared.id==tex[1][0].id);
+    WorldResidentResources partial={0};
+    partial.texture_keys=malloc(sizeof keys[0]); assert(partial.texture_keys);
+    memcpy(partial.texture_keys,keys[0],sizeof keys[0]);
+    partial.texture_binding=binding[0];
+    partial.texture_binding.count=-1; /* later decode failed after this prefix */
+    world_resident_resources_free(&partial);
+    world_texture_cache_trim(0);
+    assert(rhi_texture_is_live(shared));
+    world_texture_cache_release(keys[1],binding[1].acquired);
+    world_texture_cache_trim(0);
+    assert(!rhi_texture_is_live(shared));
+    /* Evicted occupied slots must be decoded again, even with hash collisions. */
+    for (int i=0;i<2;i++) {
+        w[i].neighborhood.scene=(N2Scene){0};
+        world_neighborhood_free(&w[i].neighborhood);
+    }
+    world_texture_cache_clear();
+}
+
 static void run_case(const char *tracks,const char *masterpath,
                      int want_count,int green,int consumer,int second_region) {
     World *w=calloc(1,sizeof *w);assert(w);
@@ -423,6 +458,35 @@ static void test_sliced_batches(void) {
     assert(glGetError()==GL_NO_ERROR);
 }
 
+static void test_local_ground_upload_preserves_cpu(void) {
+    N2Mesh meshes[2]={{0}};N2Scene scene={meshes,2,2};
+    const float triangle[]={0,0,0,0,0,4,0,0,1,0,0,4,0,0,1};
+    float verts[2][15],bounds[2][4]={{0,0,4,4},{1000,0,1004,4}};
+    uint16_t idx[]={0,1,2};unsigned char modes[2]={0};
+    RhiTexture texture=test_texture(),textures[]={texture,texture};
+    for(int i=0;i<2;i++) {
+        memcpy(verts[i],triangle,sizeof triangle);
+        for(int v=0;v<3;v++)verts[i][v*5]+=1000*i;
+        meshes[i]=(N2Mesh){.verts=verts[i],.idx=idx,.nverts=3,.nidx=3,.cat=N2_ROAD};
+    }
+    float before[2][15];memcpy(before,verts,sizeof before);
+    int full_map[2],local_map[2],full_count=0,local_count=0;
+    N2Batch *full=NULL,*local=NULL;
+    assert(upload_world_batches(&scene,bounds,textures,(RhiTexture){0},&full,NULL,full_map,modes)==2);
+    full_count=2;
+    WorldBatchUpload *job=upload_world_batches_begin_local(&scene,bounds,textures,
+        (RhiTexture){0},NULL,modes,(const float[2]){0,0},100);
+    assert(job && upload_world_batches_step(&job,8,&local,&local_count,local_map)==1);
+    assert(local_count==1 && local_map[0]==0 && local_map[1]==-1);
+    assert_same_buffer(GL_ARRAY_BUFFER,full[full_map[0]].vbo,local[0].vbo);
+    assert_same_buffer(GL_ELEMENT_ARRAY_BUFFER,full[full_map[0]].ibo,local[0].ibo);
+    /* Global CPU geometry remains valid for navigation/physics after upload. */
+    assert(scene.count==2 && !memcmp(before,verts,sizeof before));
+    assert(meshes[1].nidx==3 && meshes[1].idx[2]==2);
+    render_batch_array_free(&full,&full_count);render_batch_array_free(&local,&local_count);
+    rhi_texture_destroy(texture);
+}
+
 /* A batch is "missing art" only when EVERY member asked for a texture. The old
    gate read the FIRST member's texkey, so in a cell that mixes an authored
    untextured mesh with one whose texture failed to resolve, whether the whole
@@ -596,6 +660,7 @@ int main(void) {
     test_noise_rejects_only_mis_decodes();
     test_resident_resource_cleanup();
     test_sliced_batches();
+    test_local_ground_upload_preserves_cpu();
     test_sliced_collision();
     test_unresolved_batch_needs_every_member();
     test_sliced_u16_limit();
@@ -609,6 +674,7 @@ int main(void) {
     write_tpk(common,KEY,0);
     /* Existing region and master matches must win over the common red image. */
     write_tpk(region,KEY,1);
+    test_cache_borrowers(region);
     test_failed_upload_retry(region);
     /* A district swap rebuilds the same keys: the second build must reuse the
        first build's GL name (no re-decode, no re-upload, no second copy in

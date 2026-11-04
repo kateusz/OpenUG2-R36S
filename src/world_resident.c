@@ -11,6 +11,7 @@
 #endif
 
 #include "physics.h"
+#include "resource.h"
 
 int world_resident_policy_valid(const WResidentPolicy *policy) {
     if (!policy || !isfinite(policy->resident_radius) ||
@@ -109,8 +110,8 @@ int world_resident_route_point(const WResidentPolicy *policy,
 void world_resident_resources_free(WorldResidentResources *resources) {
     if (!resources) return;
     upload_world_batches_cancel(&resources->upload);
-    /* World textures belong to the process-wide key cache in world.c and are
-       shared with every other resident: this array only borrows them. The
+    /* World textures belong to the key cache and are shared with other live
+       residents: release this binding's references after its batches. The
        grass upload is this build's own, so it is still released here. */
     if (resources->terrain_texture.id) {
         int shared = 0;
@@ -123,6 +124,8 @@ void world_resident_resources_free(WorldResidentResources *resources) {
     render_batch_array_free(&resources->sky, &resources->sky_count);
     render_batch_array_free(&resources->glow, &resources->glow_count);
     render_batch_array_free(&resources->vista, &resources->vista_count);
+    world_texture_cache_release(resources->texture_keys,
+                                 resources->texture_binding.acquired);
     free(resources->texture_keys);
     free(resources->textures);
     free(resources->texture_modes);
@@ -268,10 +271,13 @@ static int resident_resources_step(WorldResidentResources *resources,
             &neighborhood->scene, N2_GLOW, resources->mesh_textures,
             &resources->glow, NULL);
         if (resources->sky_count < 0 || resources->glow_count < 0) goto fail;
-        resources->upload = upload_world_batches_begin(
+        /* CPU ground also supplies city-wide navigation labels. Keep that
+         * data, but do not upload a second entire city to the GPU at every
+         * transition. The 2x envelope exceeds draw + movement/safety policy. */
+        resources->upload = upload_world_batches_begin_local(
             &neighborhood->scene, (const float (*)[4])neighborhood->mbb,
             resources->mesh_textures, resources->terrain_texture,
-            NULL, resources->mesh_modes);
+            NULL, resources->mesh_modes, neighborhood->center, 2*neighborhood->radius);
         if (!resources->upload) goto fail;
         resources->batch_ticks += SDL_GetPerformanceCounter() - batch_begin;
         return 0; /* keep texture/partition work separate from ordinary uploads */
@@ -288,6 +294,8 @@ static int resident_resources_step(WorldResidentResources *resources,
             return 0;
         }
         if (resources->ordinary_count <= 0 || !resources->ordinary) goto fail;
+        res_memory_log("resident.uploaded",res_scene_bytes(&neighborhood->scene)+
+                       res_scene_bytes(&neighborhood->vista),0,0);
         if (!resident_vista_batches(resources, neighborhood)) goto fail;
 
         resources->debug_batches = (WorldMeshBatch *)calloc(
@@ -397,6 +405,7 @@ int world_resident_prepare(WorldResident *candidate,
     candidate->center[0] = center_x;
     candidate->center[1] = center_y;
     candidate->radius = args->policy.resident_radius;
+    res_memory_log("prepare.begin", 0, 0, 0);
     struct timespec t0, t1;
     if (timing) wrb_now(&t0);
 
@@ -406,6 +415,8 @@ int world_resident_prepare(WorldResident *candidate,
     };
     if (!world_neighborhood_load(&candidate->world, args->track_root,
                                  args->trackname, &options)) return 0;
+    res_memory_log("prepare.ready", res_scene_bytes(&candidate->world.scene) +
+                   res_scene_bytes(&candidate->world.vista), 0, 0);
     for (int i = 0; i < candidate->world.scene.count; i++)
         if (candidate->world.scene.meshes[i].cat == N2_SKY)
             candidate->world.scene.meshes[i].texkey = n2_sky_remap_key(
@@ -564,6 +575,8 @@ void world_resident_activate(WorldResident **active,
     *active = next;
     *candidate = previous;
     world_ground_grid_activate(&next->world.grid);
+    res_memory_log("resident.activated", res_scene_bytes(&next->world.scene) +
+                   res_scene_bytes(&next->world.vista), 0, 0);
 }
 
 void world_resident_free(WorldResident *resident) {
@@ -571,6 +584,9 @@ void world_resident_free(WorldResident *resident) {
     world_resident_resources_free(&resident->resources);
     world_neighborhood_free(&resident->world);
     free(resident);
+    /* Retired geometry was allocated by different loader/frame arenas. Free
+     * alone can leave hundreds of MiB resident and starve the next worker. */
+    res_trim_heap();
 }
 
 int world_resident_retire_step(WorldResident **slot, int max_items) {
@@ -599,6 +615,7 @@ int world_resident_retire_step(WorldResident **slot, int max_items) {
             if (!max_items) return 0;
             N2Mesh *m = &s->meshes[--s->count];
             free(m->verts); free(m->idx); free(m->vcol);
+            free(m->wall_verts); free(m->wall_idx);
             max_items--;
         }
     }

@@ -82,6 +82,12 @@ typedef struct {
     int nprops;
 } N2Batch;
 
+typedef struct { int index,bucket;uint32_t texture;unsigned material; } WorldDrawEntry;
+typedef struct { WorldDrawEntry *entries;int count,capacity; } WorldDrawQueue;
+int render_world_queue_reserve(WorldDrawQueue *q,int capacity);
+void render_world_queue_push(WorldDrawQueue *q,const N2Batch *b,int index,const float camera[3]);
+void render_world_queue_sort(WorldDrawQueue *q);
+
 /* the one shader program + its parameter block (render_params.h) */
 typedef struct {
     RhiShader shader;
@@ -97,6 +103,7 @@ typedef struct {
     RhiShader shader;
     RhiPipeline pipeline;
     HeadlightShadowParams *params;
+    int size;
     int failed;
 } HeadlightShadows;
 /* Returns caster draws, or -1 if offscreen rendering is unavailable. */
@@ -136,16 +143,6 @@ int render_car_environment(const RProg *r,CarEnvironment *s,const N2Batch *world
                            const N2Batch *sky,int nsky,const float pos[3],int quality);
 void free_car_environment(CarEnvironment *s);
 
-typedef struct { RhiBuffer body, wheel; uint32_t body_key, wheel_key; int body_count, wheel_count; } CarShadow;
-/* Caller clears the frame stencil and binds r. Leaves ordinary opaque state;
- * next draw establishes its material/model/attributes. Stencil prevents
- * overlapping caster triangles from darkening the same pixel twice. */
-int render_car_shadow(const RProg *r,CarShadow *s,const N2Scene *car,const GpuMesh *gpu,
-                      int stock,const N2Scene *rims,const GpuMesh *rim_gpu,
-                      const float model[16],const float wheels[4][16],const float mvp[16],
-                      const float ground[3],const float normal[3],int quality);
-void free_car_shadow(CarShadow *s);
-void mat_ground_shadow(const float ground[3],const float normal[3],float m[16]);
 /* One simulation tick, normalized movement; independent of the player pose. */
 void render_free_camera(float eye[3],float yaw,float pitch,const float move[3],float speed,float look[3]);
 /* Exact exponential follow for a target moving previous..desired this frame.
@@ -196,6 +193,20 @@ void mat_lookat(const float *eye, const float *fwd, float *m);   /* up = world +
  * allowed), as supplied by mat_car and the wheel/brake hub transforms. */
 void render_model(const RProg *r,const float model[16]);
 RProg    render_program(void);          /* compile+link the shader, fetch uniforms */
+/* shadow profile: 0 reference 512/4, 1 filtered 256/4, 2 fast 256/1, 3 off */
+RProg render_program_variant(int shadow_profile, int world_only);
+
+typedef struct {
+    RhiTexture color, depth;
+    RhiShader shader;
+    RhiPipeline pipeline;
+    RhiBuffer vertices;
+    int width, height, failed;
+} SceneTarget;
+/* Auxiliary passes must finish before begin. Returns 0 for native fallback. */
+int render_scene_begin(SceneTarget *s,int width,int height,const float clear[4]);
+void render_scene_composite(SceneTarget *s,const float clear[4]);
+void render_scene_free(SceneTarget *s);
 /* Build a shader from embedded source bodies (make: generated_shaders.h), each
    prefixed with a header (GLSL_VS_HEADER / GLSL_FS_HEADER, or ""). Attribute i
    is attributes[i]; blocks are its parameter layouts (may be NULL, 0).
@@ -258,6 +269,14 @@ int  upload_world_batches(const N2Scene *s, const float (*mbb)[4],
  * pending, 1 after transferring complete output, or -1 on failure. Pending and
  * failed steps leave outputs untouched. A quota is not a hard time deadline. */
 typedef struct WorldBatchUpload WorldBatchUpload;
+/* Resident variant: omit ROAD/TERRAIN GPU batches whose entire XY bounds
+ * lie beyond radius. Source CPU ground, navigation, collision and global
+ * batch-cell origin remain intact. NULL center / radius <= 0 is unbounded. */
+WorldBatchUpload *upload_world_batches_begin_local(const N2Scene *s,
+                          const float (*mbb)[4], const RhiTexture *mtex,
+                          RhiTexture texTerr, const char *audit,
+                          const unsigned char *mtexmode,
+                          const float center[2], float radius);
 WorldBatchUpload *upload_world_batches_begin(const N2Scene *s,
                           const float (*mbb)[4], const RhiTexture *mtex,
                           RhiTexture texTerr, const char *audit,
@@ -319,8 +338,7 @@ const UG2OverlayPipelines *render_overlay_pipelines(const RProg *r);
 /* Pipelines of the overlay effects: position-only car shadow and collision
    walls, and the screen-space rain. */
 typedef struct {
-    RhiPipeline car_shadow,      /* blend, no depth write, stencil EQUAL 0 / INCR */
-                walls[2][2],     /* [depth test][lines]: blend, no depth write */
+    RhiPipeline walls[2][2],     /* [depth test][lines]: blend, no depth write */
                 rain;            /* no depth test, blend, RainVertex layout */
 } UG2EffectPipelines;
 void render_effect_pipelines(const RProg *r, UG2EffectPipelines *p);
@@ -367,5 +385,10 @@ void write_png(const char *path, int w, int h, const unsigned char *rgb);
  * origin, ready for write_png) through rhi_read_pixels. Call it between
  * rhi_frame_begin and rhi_frame_end. Returns 0 on failure. */
 int  render_read_rgb(int w, int h, unsigned char *rgb);
+
+/* Returns one when an explicitly requested specialization fell back. */
+int render_world_batch(const RProg *general,const RProg *specialized,
+    const UG2WorldPipelines *legacy,const UG2WorldPipelines *fast,
+    const N2Batch *batch,float wetness,int requested);
 
 #endif

@@ -71,7 +71,7 @@ if (-not $DataOnly) {
     # EmulationStation lists top-level /roms/ports/*.sh entries. Two names for
     # the same game: "OpenUG2" can be confused with the OpenUG2 folder in the
     # Ports list, "NFSU2" cannot.
-    foreach ($name in @('OpenUG2.sh', 'NFSU2.sh', 'OpenUG2 Diagnostics.sh')) {
+    foreach ($name in @('OpenUG2.sh', 'NFSU2.sh', 'OpenUG2 Diagnostics.sh', 'OpenUG2 Performance.sh')) {
         $src = Join-Path $outDir $name
         if (-not (Test-Path -LiteralPath $src)) { throw "Missing launcher $src" }
         Copy-Item -LiteralPath $src -Destination (Join-Path $ports $name) -Force

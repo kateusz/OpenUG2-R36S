@@ -149,37 +149,9 @@ static void car_render_test(const RProg *r) {
     render_free_camera(eye,1,.5f,move,3,look);assert(eye[2]==2);
     /* Free flight has no player anchor or ground-height clamp. */
     render_free_camera(eye,1,.5f,move,10,look);assert(eye[2]==-8);
-    float gp[]={5,-8,2},normal[]={-.2f,0,.9797959f},projection[16];
-    mat_ground_shadow(gp,normal,projection);
-    float point[]={6,-9,6},hit[3];
-    for(int a=0;a<3;a++)hit[a]=projection[a]*point[0]+projection[4+a]*point[1]+projection[8+a]*point[2]+projection[12+a];
-    float distance=0;for(int a=0;a<3;a++)distance+=(hit[a]-gp[a])*normal[a];
-    assert(fabsf(distance-.025f)<1e-5f);
-    float triangle[]={.15f,.15f,0,0,0, .85f,.15f,0,1,0, .15f,.85f,0,0,1};
-    uint16_t twice[]={0,1,2,0,1,2};
-    N2Mesh mesh={0};mesh.verts=triangle;mesh.idx=twice;mesh.nverts=3;mesh.nidx=6;
-    N2Scene scene={0};scene.meshes=&mesh;scene.count=1;
-    GpuMesh *gpu=upload_scene(&scene);CarShadow shadow={0};
-    float identity[16],clip[16]={2,0,0,0,0,2,0,0,0,0,1,0,-1,-1,0,1};
-    mat_trans(0,0,0,identity);float wheels[4][16];for(int w=0;w<4;w++)memcpy(wheels[w],identity,sizeof identity);
-    float ground[]={0,0,0},up[]={0,0,1};
-    glViewport(0,0,64,64);glClearColor(1,1,1,1);glStencilMask(0xff);glClearStencil(0);
-    glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT|GL_STENCIL_BUFFER_BIT);glDisable(GL_DEPTH_TEST);
-    assert(!render_car_shadow(r,&shadow,&scene,gpu,-1,NULL,NULL,identity,wheels,clip,ground,up,0));
-    assert(render_car_shadow(r,&shadow,&scene,gpu,-1,NULL,NULL,identity,wheels,clip,ground,up,1)==1);
-    unsigned char inside[4],outside[4];
-    glReadPixels(20,20,1,1,GL_RGBA,GL_UNSIGNED_BYTE,inside);
-    glReadPixels(48,48,1,1,GL_RGBA,GL_UNSIGNED_BYTE,outside);
-    assert(inside[0]>=130 && inside[0]<=135 && outside[0]==255); /* single darkening, true triangle silhouette */
-    assert(!glIsEnabled(GL_STENCIL_TEST) && !glIsEnabled(GL_BLEND));
-    GLuint caster=rhi_gl_buffer_name(shadow.body);
-    mesh.nidx=3;GpuMesh *replacement=upload_scene(&scene);
-    glClear(GL_COLOR_BUFFER_BIT|GL_STENCIL_BUFFER_BIT);
-    assert(render_car_shadow(r,&shadow,&scene,replacement,-1,NULL,NULL,identity,wheels,clip,ground,up,2)==1);
-    assert(shadow.body_key==replacement[0].vbo.id && shadow.body_count==3);
-    caster=rhi_gl_buffer_name(shadow.body);free_car_shadow(&shadow);assert(!glIsBuffer(caster));
-    free_scene_gpu(replacement,1);free_scene_gpu(gpu,1);
-
+    N2Scene scene={0};
+    r->p->uUnlit=0;r->p->uAlpha=1;r->p->uSoft=0; /* explicit fixture setup after removing shadow draws */
+    float clip[16]={2,0,0,0,0,2,0,0,0,0,1,0,-1,-1,0,1};
     /* Six colored enclosing walls prove actual scene capture, all cube faces,
        complete publication, resizing, moving origin and Low disabling it. */
     N2Batch *batches=NULL;int count=0;N2Mesh walls[6]={{0}};
@@ -231,7 +203,7 @@ static void car_render_test(const RProg *r) {
     glActiveTexture(GL_TEXTURE0);r->p->uEnvReady = 0;
     ug2_copy(r->p->uMVP, clip, 16);r->p->uAmbient = .5f;r->p->uDiffuse = .5f;
     glClearColor(0,0,0,0);assert(glGetError()==GL_NO_ERROR);
-    puts("car rendering: free flight, sloped mesh shadow/stencil and six-face scene reflection PASS");
+    puts("car rendering: free flight and six-face scene reflection (vehicle shadows removed) PASS");
 }
 
 static void reflection_test(const RProg *r) {

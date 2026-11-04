@@ -186,6 +186,7 @@ static void build_display(OptionsMenu *m) {
 static void build_customize(OptionsMenu *m) {
     for (int i = 0; i < N_CUSTOMIZE; i++) {
         const CustRow *c = &k_customize[i];
+        if (c->gfx == ST_GFX_CAR_SHADOW) continue; /* serialized legacy value is inert */
         int max = 1;
         if (c->gfx != ST_GFX_VSYNC) {                       /* Vsync has no cap and is always present */
             int cap = m->caps ? m->caps->cap[c->gfx] : ST_NO_CAP;

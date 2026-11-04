@@ -2,8 +2,15 @@
 # Sourced by OpenUG2.sh, so keep it valid shell (no spaces around =).
 
 # Screen mode. The handheld's SDL video driver owns the display mode; this sets
-# the internal render resolution.
+# the display/window resolution. HUD and menus remain at this size.
 OPENUG2_RESOLUTION=640x480
+# Bilinearly upscale the 3D scene; native and 480x360 are comparison options.
+OPENUG2_SCENE_RESOLUTION=320x240
+# reference (512/4), filtered (256/4), fast (256/1), off (diagnostic).
+OPENUG2_HEADLIGHT_SHADOWS=fast
+# Opt-in until matched handheld comparisons pass correctness and repeat noise.
+OPENUG2_WORLD_SHADER=legacy
+OPENUG2_WORLD_ORDER=legacy
 
 # Optional SDL driver overrides. Leave commented for auto-detect.
 #OPENUG2_VIDEODRIVER=kmsdrm
@@ -30,9 +37,12 @@ OPENUG2_HUD_FIT=4:3
 
 # Extra command line arguments, e.g.:
 #   OPENUG2_ARGS="--car SKYLINE --track STREAML4RA"
-# Temporary bring-up trace: 120 seconds of input and loop progress in last-run.log.
-# Remove --input-monitor once handheld input/rendering has been verified.
-OPENUG2_ARGS="--input-monitor 120"
+# Input trace is disabled after physical controls acceptance. To investigate
+# input again, add --input-monitor 120; performance metrics are enabled below.
+OPENUG2_ARGS=""
 
 # Capture process/system memory and kernel messages around an unexpected kill.
 OPENUG2_RESOURCE_MONITOR=1
+
+# Per-frame CPU sections, process CPU time and optional GPU timers.
+OPENUG2_PERF_MONITOR=1

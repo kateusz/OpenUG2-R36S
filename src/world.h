@@ -47,6 +47,7 @@ typedef struct {
     char name[64];
     unsigned char *data; long len;   /* file buffer, freed after texture bind */
     N2Tpk tpk;
+    int mapped;                    /* read-only file mapping, not a heap copy */
     int mesh0, mesh1;                /* this region's mesh range in the scene */
 } WRegion;
 
@@ -62,6 +63,8 @@ typedef struct {
     int *start;
     int *list;
     float (*bounds)[4]; /* per mesh: XY bounds of its indexed triangles */
+    int *block_start;             /* optional, per-mesh 16-triangle blocks */
+    float (*block_bounds)[4];      /* conservative expanded XY coverage */
 } WGroundGrid;
 
 typedef struct {
@@ -69,9 +72,9 @@ typedef struct {
     N2Scene vista;
     WRegion rgn[WORLD_MAXREG];
     int nreg;
-    unsigned char *loc4; long loc4len;
+    unsigned char *loc4; long loc4len; int loc4_mapped;
     unsigned char *master; long masterlen; N2Tpk mastertpk; int master_mapped;
-    unsigned char *common; long commonlen; N2Tpk commontpk;
+    unsigned char *common; long commonlen; N2Tpk commontpk; int common_mapped;
     N2Tex grass; int have_grass;
     N2LightSrc *lights; int nlights, lightcap;
     float (*mbb)[4];
@@ -250,9 +253,10 @@ int world_bind_textures(World *w, uint32_t *keys, RhiTexture *texs,
  * attempts per step (misses count too); cached requests do not consume quota.
  * count/map are partial until complete. Only one binding may be in flight,
  * on the GL thread. Cancel via normal neighborhood/resource teardown: this
- * cursor owns no allocations, and the cache retains successful GL uploads. */
+ * cursor owns no allocations; release acquired keys during resource teardown. */
 typedef struct {
     int pass, region, request, count;
+    int acquired; /* valid key entries even when count becomes -1 on failure */
     uint32_t build, source;
 } WTextureBind;
 int world_bind_textures_step(World *w, uint32_t *keys, RhiTexture *texs,
@@ -260,14 +264,18 @@ int world_bind_textures_step(World *w, uint32_t *keys, RhiTexture *texs,
                              WTextureBind *binding, int max_decodes);
 
 /* The textures world_bind_textures writes are owned by a process-wide
- * key -> texture cache, not by the caller: a moving-residency swap re-requests
- * essentially the same ~1100 keys, and re-decoding/re-uploading them was the
- * bulk of the frame-thread stall at a district boundary. Callers borrow the
- * names and must not delete them. Binding returns -1 on allocation/upload
+ * key -> texture cache. Concurrent residents share images with references;
+ * callers release their binding's acquired keys and must not delete names
+ * directly. Binding returns -1 on allocation/upload
  * failure; callers must reject that candidate. Releases every cached texture; call it on a
  * GL thread, and before pointing the loader at different archives in the same
  * process (a track switch re-execs, so only tests need that). */
 void world_texture_cache_clear(void);
+/* GL thread: release one binding's unique keys; live borrowers stay protected.
+ * Idle decoded images are limited to 32 MiB. Trim(0) drops all idle images
+ * before another CPU preparation, reducing transition overlap. */
+void world_texture_cache_release(const uint32_t *keys, int count);
+void world_texture_cache_trim(size_t idle_budget);
 
 /* Ground height at (x,y): same contract as n2_ground_z but only tests the
  * road/terrain meshes whose bbox covers the point (grid lookup). */

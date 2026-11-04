@@ -135,7 +135,8 @@ static void tail_lamp_test(const RProg *r) {
     puts("PASS: rear lamps retain texture detail; day/night brakes, running lights and nitro response");
 }
 
-int main(void) {
+int main(int argc,char **argv) {
+    int profile=argc>1?atoi(argv[1]):0;shadows.size=profile?256:512;
     /* Window and lamp-cover order uses each slice's indices, not the shared
        pool (which also contains an unrelated far vertex). Equal depths are stable. */
     float glass_verts[]={0,0,0,0,0, 0,0,2,0,0, 0,0,999,0,0};
@@ -161,7 +162,7 @@ int main(void) {
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION,1);
     SDL_Window *window=SDL_CreateWindow("Headlight shader test",0,0,128,64,SDL_WINDOW_OPENGL|SDL_WINDOW_HIDDEN);
     assert(window);SDL_GLContext context=SDL_GL_CreateContext(window);assert(context);
-    RProg r=render_program();glUseProgram(r.prog);GLint linked=0;glGetProgramiv(r.prog,GL_LINK_STATUS,&linked);assert(linked);
+    RProg r=render_program_variant(profile,0);glUseProgram(r.prog);GLint linked=0;glGetProgramiv(r.prog,GL_LINK_STATUS,&linked);assert(linked);
     /* The normal buffer uses authored smoothing, with a per-vertex fallback
        for zero/NaN source data. Position/UV layout stays five floats wide. */
     float normal_verts[]={0,0,0,0,0, 1,0,0,1,0, 0,1,0,0,1,

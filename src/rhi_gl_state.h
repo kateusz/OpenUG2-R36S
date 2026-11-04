@@ -129,6 +129,8 @@ void gls_get_uniformfv(GLuint program, GLint loc, GLfloat *out, int n);
 /* Reads that had to go to GL because the pname/cap/location is not modelled
  * (diagnostic; 0 in every current path). */
 unsigned gls_fallback_queries(void);
+void gls_reset_frame_stats(void);
+void gls_frame_stats(unsigned *program,unsigned *texture,unsigned *state);
 
 #ifdef __cplusplus
 }

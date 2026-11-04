@@ -1638,6 +1638,11 @@ static int present_frame(void) {
     return 1;
 }
 
+RhiResult rhi_profile_finish(void) { return RHI_ERR_UNSUPPORTED; }
+RhiResult rhi_profile_main_size(int32_t width, int32_t height) {
+    (void)width;(void)height;return RHI_ERR_UNSUPPORTED;
+}
+
 RhiResult rhi_frame_end(void) {
     if (!g_vk.device || !g_vk.in_frame) return RHI_ERR_INVALID;
     if (g_vk.pass.active) rhi_cmd_end_pass();         /* a pass does not outlive its frame */
@@ -3573,3 +3578,5 @@ int rhi_timer_read(RhiTimer timer, uint64_t *ns) {
     *ns = (uint64_t)((double)ticks * (double)props.limits.timestampPeriod);
     return 1;
 }
+
+RhiFrameStats rhi_frame_stats(void){return (RhiFrameStats){0};} /* GL state metrics do not apply. */

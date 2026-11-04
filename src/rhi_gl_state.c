@@ -38,7 +38,7 @@ typedef struct {
     GLint viewport[4];
     GLint program, framebuffer, renderbuffer, array_buffer, element_buffer;
     GLint active;                   /* unit index, 0-based */
-    GLint tex2d[GLS_UNITS];
+    GLint tex2d[GLS_UNITS],texcube[GLS_UNITS];
     GLint attrib[GLS_ATTRIBS];
     GlsAttribPointer aptr[GLS_ATTRIBS];   /* glVertexAttribPointer state, GL initial values until set */
     GlsProgram prog[GLS_PROGRAMS];
@@ -46,6 +46,9 @@ typedef struct {
 
 static GlsState S;
 static unsigned g_fallback;
+static unsigned stat_program,stat_texture,stat_state;
+void gls_reset_frame_stats(void){stat_program=stat_texture=stat_state=0;}
+void gls_frame_stats(unsigned *p,unsigned *t,unsigned *s){*p=stat_program;*t=stat_texture;*s=stat_state;}
 static int g_prog_overflow;         /* table filled up: unknown programs ask GL */
 
 static void drop_program(GlsProgram *p) { free(p->slot); memset(p, 0, sizeof *p); }
@@ -103,11 +106,11 @@ static int cap_index(GLenum cap) {
 
 /* ---- fixed-function shims ---- */
 void glsEnable(GLenum cap) {
-    int i = cap_index(cap); if (i >= 0) st()->enabled[i] = GL_TRUE;
+    int i = cap_index(cap); if (i >= 0) {if(!st()->enabled[i])stat_state++;st()->enabled[i] = GL_TRUE;}
     glEnable(cap);
 }
 void glsDisable(GLenum cap) {
-    int i = cap_index(cap); if (i >= 0) st()->enabled[i] = GL_FALSE;
+    int i = cap_index(cap); if (i >= 0) {if(st()->enabled[i])stat_state++;st()->enabled[i] = GL_FALSE;}
     glDisable(cap);
 }
 void glsBlendFunc(GLenum src, GLenum dst) {
@@ -117,6 +120,7 @@ void glsBlendFunc(GLenum src, GLenum dst) {
 }
 void glsBlendFuncSeparate(GLenum src_rgb, GLenum dst_rgb, GLenum src_a, GLenum dst_a) {
     GlsState *s = st();
+    if(s->blend[0]!=(GLint)src_rgb || s->blend[1]!=(GLint)dst_rgb || s->blend[2]!=(GLint)src_a || s->blend[3]!=(GLint)dst_a)stat_state++;
     s->blend[0] = (GLint)src_rgb; s->blend[1] = (GLint)dst_rgb;
     s->blend[2] = (GLint)src_a;   s->blend[3] = (GLint)dst_a;
     glBlendFuncSeparate(src_rgb, dst_rgb, src_a, dst_a);
@@ -131,10 +135,11 @@ void glsBlendEquationSeparate(GLenum rgb, GLenum alpha) {
     s->blend_eq[0] = (GLint)rgb; s->blend_eq[1] = (GLint)alpha;
     glBlendEquationSeparate(rgb, alpha);
 }
-void glsDepthFunc(GLenum func) { st()->depth_func = (GLint)func; glDepthFunc(func); }
-void glsDepthMask(GLboolean mask) { st()->depth_mask = mask ? GL_TRUE : GL_FALSE; glDepthMask(mask); }
+void glsDepthFunc(GLenum func) { if(st()->depth_func!=(GLint)func)stat_state++;st()->depth_func = (GLint)func; glDepthFunc(func); }
+void glsDepthMask(GLboolean mask) { if(!st()->depth_mask!=!mask)stat_state++;st()->depth_mask = mask ? GL_TRUE : GL_FALSE; glDepthMask(mask); }
 void glsColorMask(GLboolean r, GLboolean g, GLboolean b, GLboolean a) {
     GlsState *s = st();
+    if(!s->color_mask[0]!=!r || !s->color_mask[1]!=!g || !s->color_mask[2]!=!b || !s->color_mask[3]!=!a)stat_state++;
     s->color_mask[0] = r ? GL_TRUE : GL_FALSE; s->color_mask[1] = g ? GL_TRUE : GL_FALSE;
     s->color_mask[2] = b ? GL_TRUE : GL_FALSE; s->color_mask[3] = a ? GL_TRUE : GL_FALSE;
     glColorMask(r, g, b, a);
@@ -162,7 +167,7 @@ void glsLineWidth(GLfloat width) {
     st()->line_width = width;   /* GL returns the set value, not the raster clamp */
     glLineWidth(width);
 }
-void glsUseProgram(GLuint program) { st()->program = (GLint)program; glUseProgram(program); }
+void glsUseProgram(GLuint program) { if(st()->program!=(GLint)program)stat_program++;st()->program = (GLint)program; glUseProgram(program); }
 void glsBindFramebuffer(GLenum target, GLuint fbo) {
     st()->framebuffer = (GLint)fbo; glBindFramebuffer(target, fbo);
 }
@@ -183,14 +188,17 @@ void glsDeleteRenderbuffers(GLsizei n, const GLuint *ids) {
 void glsActiveTexture(GLenum unit) { st()->active = (GLint)(unit - GL_TEXTURE0); glActiveTexture(unit); }
 void glsBindTexture(GLenum target, GLuint texture) {
     GlsState *s = st();
-    if (target == GL_TEXTURE_2D && s->active >= 0 && s->active < GLS_UNITS)
-        s->tex2d[s->active] = (GLint)texture;
+    if(s->active>=0 && s->active<GLS_UNITS && (target==GL_TEXTURE_2D || target==GL_TEXTURE_CUBE_MAP)) {
+        GLint *binding=target==GL_TEXTURE_2D?&s->tex2d[s->active]:&s->texcube[s->active];
+        if(*binding==(GLint)texture)return;
+        *binding=(GLint)texture;stat_texture++;
+    }
     glBindTexture(target, texture);
 }
 void glsDeleteTextures(GLsizei n, const GLuint *ids) {
     GlsState *s = st();
     for (GLsizei i = 0; i < n; i++)
-        for (int u = 0; ids[i] && u < GLS_UNITS; u++) if (s->tex2d[u] == (GLint)ids[i]) s->tex2d[u] = 0;
+        for (int u = 0; ids[i] && u < GLS_UNITS; u++) {if (s->tex2d[u] == (GLint)ids[i]) s->tex2d[u] = 0; if(s->texcube[u] == (GLint)ids[i])s->texcube[u]=0;}
     glDeleteTextures(n, ids);
 }
 void glsBindBuffer(GLenum target, GLuint buffer) {

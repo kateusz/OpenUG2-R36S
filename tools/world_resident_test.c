@@ -414,7 +414,52 @@ static void test_background_scene(const char *root, const char *track) {
     world_resident_free(active);
 }
 
+static void test_ground_blocks_preserve_queries(void) {
+    enum { N=193 }; /* partial last block, stacked layers and sloped faces */
+    N2Mesh meshes[2]={{0}};N2Scene scene={meshes,2,2};
+    float bounds[2][4]={{0,-3,N*2,3},{0,-3,N*2,3}};
+    for(int k=0;k<2;k++) {
+        N2Mesh *m=meshes+k;m->nverts=N*3;m->nidx=N*3;m->cat=k?N2_TERRAIN:N2_ROAD;
+        m->verts=calloc(N*15,sizeof(float));m->idx=malloc(N*3*sizeof(uint16_t));
+        assert(m->verts && m->idx);
+        for(int t=0;t<N;t++)for(int v=0;v<3;v++) {
+            float *p=m->verts+(t*3+v)*5;
+            p[0]=t*2+(v==1?2:0);p[1]=v==2?3:-3;
+            p[2]=k*1.5f+(t%7)*.1f+(v==1?.2f:0);
+            m->idx[t*3+v]=(uint16_t)(t*3+v);
+        }
+    }
+    WGroundGrid grid={0};assert(world_ground_grid_build(&grid,&scene,bounds));
+    assert(grid.block_start && grid.block_bounds);
+    unsigned seed=179;
+    for(int i=0;i<6000;i++) {
+        seed=seed*1664525u+1013904223u;float x=(seed%39000)/100.f-2;
+        seed=seed*1664525u+1013904223u;float y=(seed%800)/100.f-4;
+        float ref=i%4==0?N2_GROUND_HIGHEST:(i%4)*.8f;
+        WGroundHit a,b,wa,wb,ca,cb;int va,vb;
+        world_ground_grid_activate(&grid);
+        int ra=world_ground_hit(&scene,x,y,ref,&a);
+        int qa=world_wheel_support(&scene,x,y,ref,.5f,1,&wa,&ca,&va);
+        world_ground_grid_activate(NULL);
+        int rb=world_ground_hit(&scene,x,y,ref,&b);
+        int qb=world_wheel_support(&scene,x,y,ref,.5f,1,&wb,&cb,&vb);
+        assert(ra==rb && qa==qb && va==vb);
+        if(ra) {
+            assert(a.mesh==b.mesh && a.tri==b.tri && a.z==b.z);
+            assert(!memcmp(a.normal,b.normal,sizeof a.normal));
+        }
+        if(qa) {
+            assert(wa.mesh==wb.mesh && wa.tri==wb.tri && wa.z==wb.z);
+            assert(!memcmp(wa.normal,wb.normal,sizeof wa.normal));
+        }
+        assert(ca.mesh==cb.mesh && ca.tri==cb.tri && ca.z==cb.z);
+    }
+    world_ground_grid_free(&grid);
+    for(int k=0;k<2;k++){free(meshes[k].verts);free(meshes[k].idx);}
+}
+
 int main(int argc, char **argv) {
+    test_ground_blocks_preserve_queries();
     test_policy();
     test_route_points();
     test_ground_grid_ownership();

@@ -19,6 +19,26 @@ runtime_memory_snapshot() {
     ' "${files[@]}" 2>/dev/null
 }
 
+# Raw cumulative counters retain per-core/process utilization without assuming
+# kernel HZ or CPU count. Uptime correlates samples with the memory line.
+runtime_performance_snapshot() {
+    local engine_pid="$1" path value
+    printf 'cpu_ticks: '
+    awk '/^cpu[0-9]* / {printf "%s;", $0} END {print ""}' /proc/stat
+    if [ -r "/proc/$engine_pid/stat" ]; then
+        printf 'process_stat: '; cat "/proc/$engine_pid/stat" 2>/dev/null
+    fi
+    for path in /sys/devices/system/cpu/cpufreq/policy*/scaling_cur_freq \
+                /sys/class/devfreq/*/cur_freq /sys/class/devfreq/*/load \
+                /sys/class/devfreq/*/utilization /sys/class/devfreq/*/utilisation \
+                /sys/class/devfreq/*/device/utilisation \
+                /sys/class/thermal/thermal_zone*/temp; do
+        [ -r "$path" ] || continue
+        value=$(cat "$path" 2>/dev/null) || continue
+        printf 'sensor: %s=%s\n' "$path" "$value"
+    done
+}
+
 runtime_system_snapshot() {
     runtime_memory_snapshot
     printf '\n--- kernel messages (last 160 lines; may require permissions) ---\n'
@@ -33,6 +53,7 @@ run_monitored_engine() {
     local engine_pid watcher_pid engine_status
     local resource_log="$STATE_DIR/resource.log"
     runtime_system_snapshot > "$STATE_DIR/system-before.log" 2>&1
+    echo "clock_ticks_per_second: $(getconf CLK_TCK 2>/dev/null || echo unknown)" >> "$STATE_DIR/system-before.log"
     : > "$resource_log"
     echo "runtime: memory samples in $resource_log; kernel snapshots in system-before.log/system-after.log"
     "$RUNDIR/nfsu2" "$@" &
@@ -40,6 +61,7 @@ run_monitored_engine() {
     (
         while kill -0 "$engine_pid" 2>/dev/null; do
             runtime_memory_snapshot "$engine_pid" >> "$resource_log"
+            runtime_performance_snapshot "$engine_pid" >> "$resource_log"
             sleep 1
         done
     ) &

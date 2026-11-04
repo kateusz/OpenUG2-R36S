@@ -79,6 +79,7 @@ typedef struct RhiCaps {
     float      max_anisotropy;   /* 1.0 = anisotropic filtering unavailable */
     uint8_t    tex_bc1, tex_bc2, tex_bc3;  /* S3TC DXT1/3/5 uploads supported */
     uint8_t    wireframe;        /* rhi_cmd_set_wireframe works (debug views) */
+    uint8_t    depth24_target;  /* D24 renderbuffer targets supported */
     uint8_t    gpu_timer;        /* RhiTimer measurements work (profiling) */
     int32_t    max_texture_size; /* largest texture width/height, pixels */
 } RhiCaps;
@@ -98,6 +99,13 @@ typedef struct RhiFrameInfo {
 RhiResult rhi_frame_begin(RhiFrameInfo *out);
 /* Ends the frame and presents it (GL: SDL_GL_SwapWindow). */
 RhiResult rhi_frame_end(void);
+/* Profiling only: drain previously submitted GL work before presentation.
+ * This serializes CPU/GPU execution and changes timing; normal play never
+ * calls it. Unsupported on backends whose frame is not yet submitted. */
+RhiResult rhi_profile_finish(void);
+/* Profiling only: shrink this open frame's logical main viewport/readback
+ * region without resizing the display. Reset by the next frame_begin. GL only. */
+RhiResult rhi_profile_main_size(int32_t width, int32_t height);
 
 /* ------------------------------------------------------------------------------ */
 /* Readback                                                                       */
@@ -178,6 +186,7 @@ typedef enum RhiFormat {
     RHI_FORMAT_BC2   = 4,  /* S3TC DXT3, caps.tex_bc2 */
     RHI_FORMAT_BC3   = 5,  /* S3TC DXT5, caps.tex_bc3 */
     RHI_FORMAT_D16   = 6,  /* 16-bit depth; render target only for now */
+    RHI_FORMAT_D24 = 8, /* 24-bit depth render target; capability-gated */
     RHI_FORMAT_DEPTH = 7   /* depth with the main target's precision: copies of
                               the main depth (rhi_cmd_copy_main_to_texture) */
 } RhiFormat;
@@ -506,6 +515,10 @@ RhiResult rhi_cmd_timer_end(void);   /* ends the running timer */
 /* 1 with *ns set once the timer's last measurement has finished on the GPU;
  * 0 while it has not (or for an invalid timer). */
 int       rhi_timer_read(RhiTimer timer, uint64_t *ns);
+
+/* Effective backend changes in the current frame, from the existing state tracker. */
+typedef struct { uint32_t program_changes,texture_changes,state_changes; } RhiFrameStats;
+RhiFrameStats rhi_frame_stats(void);
 
 #ifdef __cplusplus
 }

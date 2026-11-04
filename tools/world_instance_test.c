@@ -528,6 +528,7 @@ static void test_ground_stage_eligibility_and_failure(void) {
     assert(stats.own_matrix_meshes == 1);
     free_scene(&scene);
 
+
     proto[1] = proto[0];
     library.count = 2;
     memset(&scene, 0, sizeof scene);
@@ -1302,6 +1303,26 @@ static long add_common_material_model(unsigned char *buf, long pos,
                                            "XO_COMMON_MATERIAL");
 }
 
+static void test_lazy_prototype_matches_eager(void) {
+    const char *names[]={"XO_COMMON_MATERIAL","TRN_TEST_GROUND","PAN_HILLRIDGE"};
+    for (int n=0;n<3;n++) {
+        unsigned char object[4096]; uint32_t keys[]={0xaabbccddu,0x11223344u};
+        long length=add_common_material_model_named(object,0,0x55667788u,keys[0],keys[1],names[n]);
+        WInstLibrary eager={0},lazy={0};lazy.lazy=1;
+        winst_collect_models(&eager,object,0,length,keys,2);
+        winst_collect_models(&lazy,object,0,length,keys,2);
+        assert(eager.count==1 && lazy.count==1 && !lazy.items[0].scene.meshes);
+        assert(eager.items[0].model_key==lazy.items[0].model_key);
+        assert(eager.items[0].is_vista==lazy.items[0].is_vista);
+        assert(winst_proto_is_ground(&eager.items[0])==winst_proto_is_ground(&lazy.items[0]));
+        assert(winst_prepare_proto(&lazy,&lazy.items[0]));
+        assert(eager.items[0].scene.count==lazy.items[0].scene.count);
+        for(int i=0;i<eager.items[0].scene.count;i++)
+            assert(n2_mesh_same_content(&eager.items[0].scene.meshes[i],&lazy.items[0].scene.meshes[i]));
+        winst_library_free(&eager);winst_library_free(&lazy);
+    }
+}
+
 /* M149 regression: PAN_* prototypes are authored far-horizon geometry. The
    legacy parser already routes them away from the physical scene, and the
    instance builder must preserve that contract. Otherwise PAN_HILLRIDGE is
@@ -1515,6 +1536,7 @@ int main(void) {
     test_world2_capture_policy();
     test_world_spawn_policy();
     test_common_key_submesh_resolution();
+    test_lazy_prototype_matches_eager();
     test_panorama_prototype_routes_to_vista();
     test_impostor_atlas_routes_unnamed_backdrop_to_vista();
     test_lightpool_slot_is_dropped_not_substituted();

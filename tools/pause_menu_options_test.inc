@@ -90,7 +90,7 @@ static void options_checks(void) {
     key(p, SDLK_DOWN);
     key(p, SDLK_RETURN);
     settle_ms(p, 330);
-    assert(om_screen(om) == OM_SCREEN_CUSTOMIZE && !strcmp(view_name(p), "UI_PC_Customize_Options.fng") && om_row_count(om) == 22);
+    assert(om_screen(om) == OM_SCREEN_CUSTOMIZE && !strcmp(view_name(p), "UI_PC_Customize_Options.fng") && om_row_count(om) == 21);
     assert(!strcmp(p->scr.scene.nodes[p->list_v.header].text_override, "Customize Display Settings"));
     key(p, SDLK_ESCAPE);
     assert(om->exiting && om_exit_ms(OM_CTX_INGAME, OM_SCREEN_CUSTOMIZE) == 140);

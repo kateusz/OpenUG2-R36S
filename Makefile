@@ -175,9 +175,9 @@ tire-marks-render-test: tools/tire_marks_render_test.c tools/test_json.h src/tir
 
 .PHONY: tire-marks-render-test
 
-world-instance-test: tools/world_instance_test.c src/world_instance.c src/physics.c src/physics.h src/world_instance.h src/world_capture_policy.h src/nfsu2.h src/world_group_reader.h src/world_scenery.h
+world-instance-test: tools/world_instance_test.c src/world_instance.c src/resource.c src/physics.c src/physics.h src/world_instance.h src/world_capture_policy.h src/nfsu2.h src/world_group_reader.h src/world_scenery.h
 	@mkdir -p build
-	$(CC) $(CFLAGS) -DWORLD_INSTANCE_TESTING -Isrc tools/world_instance_test.c src/world_instance.c src/physics.c -o build/world_instance_test -lm
+	$(CC) $(CFLAGS) -DWORLD_INSTANCE_TESTING -Isrc tools/world_instance_test.c src/world_instance.c src/resource.c src/physics.c -o build/world_instance_test -lm
 	./build/world_instance_test
 
 vinyl-census: tools/vinyl_census.c src/nfsu2.h
@@ -467,7 +467,9 @@ clean:
 headlight-render-test: tools/headlight_render_test.c tools/legacy_draw.h src/render.c src/render_params.c src/rhi_gl_state.c src/rhi_gl.c src/tex_override.c src/render.h src/nfsu2.h src/generated_shaders.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(SDL_CFLAGS) -Isrc tools/headlight_render_test.c src/render.c src/render_params.c src/rhi_gl_state.c src/rhi_gl.c src/tex_override.c -o build/headlight_render_test $(SDL_LIBS) $(GL_LIBS) -lz -lm
-	./build/headlight_render_test
+	./build/headlight_render_test 0
+	./build/headlight_render_test 1
+	./build/headlight_render_test 2
 
 
 # The test includes rhi_gl.c for controlled framebuffer-allocation failure.
@@ -882,3 +884,15 @@ dir-scan-test: tools/dir_scan_test.c src/dir_scan.h
 data-path-cli-test: debug
 	sh tools/data_path_cli_test.sh ./$(GAME)
 .PHONY: data-path-cli-test
+
+# Production GLES composition and material-parity fixture, with injected FBO failure.
+render-optimization-test: tools/render_optimization_test.c src/render.c src/render_params.c src/rhi_gl_state.c src/tex_override.c $(HDRS) $(GEN)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -DN2_GLES $(SDL_CFLAGS) -Isrc tools/render_optimization_test.c src/render.c src/render_params.c src/rhi_gl_state.c src/tex_override.c -o build/render_optimization_test $(SDL_LIBS) -lGLESv2 -lz -lm
+	./build/render_optimization_test
+.PHONY: render-optimization-test
+
+render-optimization-check: render-optimization-test
+	python3 tools/vehicle_shadow_removal_test.py
+	python3 tools/arm64/test-performance-analysis.py
+.PHONY: render-optimization-check

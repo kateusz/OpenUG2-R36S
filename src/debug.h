@@ -150,7 +150,7 @@ typedef struct {
     float fog_r, fog_g, fog_b;  /* fog + sky-clear colour (kept identical) */
 
     /* --- car appearance --- */
-    int   vehicle_quality;       /* 0 Low, 1 Medium, 2 High: paint/glass, scene capture and car shadows */
+    int   vehicle_quality;       /* 0 Low, 1 Medium, 2 High: paint/glass and scene capture */
     int   paint_shine;           /* authored streetlight highlights on painted panels */
     int   paint_override;        /* 1 = use paint[] below instead of the per-car hash */
     float paint[3];

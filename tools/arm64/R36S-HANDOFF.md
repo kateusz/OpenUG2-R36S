@@ -6,14 +6,16 @@ Repository: `C:\Users\matku\repos\OpenUG2`
 Branch: **`arm64-r36s`**
 Fork: https://github.com/kateusz/OpenUG2-R36S
 
-**Latest acceptance — 2026-11-04:** the user confirmed that the game runs
-correctly on the physical R36S and reacts to controls with the 500 m load /
-450 m draw preset. FPS is very low. Performance investigation is explicitly
-deferred to later work. This supersedes the earlier input/crash blocker notes;
-those notes remain below as investigation history, not current status.
+**Latest status - 2026-11-04:** the final 213532EA build has a returned physical
+run with user-confirmed normal gameplay and higher FPS. Logs show exit 0, no
+OOM messages, and 6.86 FPS (earlier capture 3.50). No replacement resident
+activated: preparation takes 21-28 seconds and results become obsolete.
+Streaming acceptance and GPU/display attribution remain open. The completed Performance run shows strong pixel sensitivity and rendering
+completion waits; vsync-off was refused. See PERFORMANCE-RETURN-20261104.md
+and PERFORMANCE-COMPARISON-20261104.md.
 
 This document is written so a fresh agent can continue without re-deriving anything.
-Read the latest acceptance above first; older blocker sections are historical.
+Read the latest status above first; older blocker sections are historical.
 
 ---
 
@@ -27,8 +29,8 @@ Read the latest acceptance above first; older blocker sections are historical.
 | Diagnostics port | **works** (pad + data audit logs written on device) |
 | Game launches and renders | **works** (user confirmed: "it runs the game") |
 | **Input** | **Works on physical R36S — user confirmed actions respond** |
-| **Runtime stability** | **User-confirmed successful run with 500/450 preset**; long-run endurance not measured |
-| Performance | **Very low FPS on R36S — user reported; investigation deferred** |
+| **Runtime stability** | **OOM during sustained driving in the last physical capture; new candidate awaiting handheld acceptance** |
+| Performance | **3.50 FPS in returned capture; native CPU improvement measured, R36S follow-up pending** |
 
 **Earlier 2026-11-04 investigation (historical):** a diagnostic build and a verified four-axis SDL
 default fix have been deployed to the card. The user clarified that the image
@@ -38,8 +40,8 @@ See section 15 before following the older proposed debugging steps below.
 **Latest device follow-up:** see section 16. The default preset is now 500 m
 load / 450 m draw with memory and kernel evidence capture enabled.
 
-The current functional smoke test passes on R36S; low FPS remains open. Do **not** redo the
-build pipeline or the data copy unless something is actually broken.
+Startup/input acceptance remains valid. Sustained driving failed in the returned
+physical capture. Follow PERFORMANCE.md for the new candidate and its evidence.
 
 ---
 
@@ -766,3 +768,75 @@ system-after.log** before another run. Check the minimum MemAvailable, process
 VmRSS/VmHWM/VmSwap, OOM counter delta, and kernel `Out of memory` / `Killed
 process ... nfsu2` / Mali messages. Successful survival, driving, pause, frame
 rate and long-run streaming remain unverified on the physical device.
+
+## 17. Performance evidence capture � 2026-11-04
+
+The user confirmed working gameplay/controls, with very low FPS. Added default
+launcher profiling using the existing --perf-csv, process CPU and frame wall
+time, one-second CPU/system/sensor samples and periodic log flushing. Temporary
+input tracing is disabled. Graphics and world distance settings stay unchanged.
+See [PERFORMANCE.md](PERFORMANCE.md) for collection and interpretation. Physical
+R36S performance capture and CPU/GPU attribution are pending.
+
+## Device capture returned: OOM during driving - 2026-11-04
+
+The instrumented physical run was killed by the kernel OOM handler during
+world-prepare (exit 137). Startup and inputs work, but sustained driving is
+currently failing. 217 saved frames averaged 3.50 FPS excluding the first
+setup-contaminated row. Memory/streaming peak reduction takes priority over
+render tuning. See PERFORMANCE-DEVICE-20261104.md for evidence and limits.
+
+## 18. Memory/AI candidate and controlled comparison - 2026-11-04
+
+The new candidate uses mapped archives, a bounded decoded prototype cache,
+resident texture references with idle eviction, local ground GPU uploads,
+retirement arena reclamation and accelerated ground-query blocks. Global CPU
+navigation/collision ground is retained. Graphics preset remains 640x480,
+500 m load / 450 m draw.
+
+Native forced-decode testing under 700 MiB / no swap completed two exact-image
+route transitions and a 6000-frame drive with three background swaps, exit 0
+and no additional OOM events. The isolated AI section fell from 1.8514 to
+0.9070 ms in a matching native comparison; no R36S FPS gain is claimed yet.
+All nine relevant native test targets, renderer boundary, launcher failure
+cases and five visible render/presentation comparison cases pass.
+
+Final ARM GLES build / --input-info smoke pass, GLIBC max 2.29. Deployed binary:
+213532EADAA62DF9C86FED53E5EF7F9C1C666E7E43C1546C494C513AB6428B7F.
+Eleven payloads and four menu entries match staging; card ACLs applied; old
+returned logs preserved. OpenUG2 Performance now runs the five-case comparison
+into a fresh perf-compare directory. Normal play also writes memory.csv.
+
+See PERFORMANCE-CHANGES-20261104.md for details/evidence/limits and PERFORMANCE.md
+for the physical driving acceptance and comparison sequence. Do not mark the
+handheld OOM resolved until a returned R36S drive survives this candidate.
+
+
+19. Rendering candidate and eight-case comparison - 2026-11-04
+
+Vehicle shadows are removed throughout this fork. The R36S launcher now defaults
+to a 320x240 RGBA8/D24 3D scene, bilinearly composed onto the native 640x480
+HUD/menu/pause display, with fast 256x256 / one-sample headlight world shadows.
+Load/view remain 500/450 m. Specialized dry-world shading and 32 m depth ordering
+are implemented but remain opt-in (legacy defaults) pending handheld acceptance.
+
+Final ARM GLES build and QEMU startup/input discovery pass (GLIBC max 2.29).
+Deployed SHA-256: 4F10439F7E5944F851401AD596ABA03F94C28E9CBAA9D4B1B38D440767D2B921.
+Eleven payloads/four menu entries match staging; LF/BOM and ACL checks pass.
+Existing card evidence and returned comparisons are preserved; data not recopied.
+
+GLES composition/D24/HUD/failure and material/headlight parity fixtures pass,
+as do targeted renderer/UI/residency tests, native desktop and Vulkan builds
+and validation smoke. Final PC eight-case run completed 120 frames/case with
+zero vehicle-shadow time/fallbacks and pixel-identical shader/order/repeat
+screenshots. Repeat drift +1.10% native and -3.75% optimized passed the timing
+gate. PC software-renderer timing does not establish a handheld FPS gain.
+
+OpenUG2 Performance now runs eight fresh cases with isolated logs/settings/save
+snapshots, preserving normal evidence. First 20 and screenshot frames excluded;
+over 5% repeat drift invalidates attribution. Return its new perf-compare folder,
+then a normal NFSU2 driving run. Physical new-build acceptance is PENDING.
+Streaming preparation/stale targets remain a separate unresolved task.
+
+See RENDERING-OPTIMIZATIONS-20261104.md and PERFORMANCE.md for details, regression
+coverage, artifact locations and the exact next device run.

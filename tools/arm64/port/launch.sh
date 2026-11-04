@@ -33,6 +33,10 @@ echo "OpenUG2: port directory $PORTDIR"
 
 # User-editable settings; keep config.txt valid shell.
 [ -f "$PORTDIR/config.txt" ] && . "$PORTDIR/config.txt"
+if [ "${OPENUG2_COMPARE:-0}" = 1 ]; then
+    OPENUG2_PERF_MONITOR=1
+    OPENUG2_RESOURCE_MONITOR=1
+fi
 
 GAME="$PORTDIR/nfsu2"
 DATA="$PORTDIR/data"
@@ -53,6 +57,9 @@ done
 echo "OpenUG2: state directory $STATE_DIR"
 
 LOG="$STATE_DIR/last-run.log"
+if [ "${OPENUG2_COMPARE:-0}" = 1 ]; then
+    LOG=$(mktemp "$STATE_DIR/performance-entry-XXXXXX.log") || exit 1
+fi
 mkdir -p "$RUNDIR" 2>/dev/null
 
 # Settings and profiles follow the writable state directory.
@@ -101,6 +108,10 @@ chmod +x "$RUNDIR/nfsu2" 2>/dev/null
 # shellcheck disable=SC2086  # OPENUG2_ARGS is a deliberately word-split list
 set -- "$DATA" \
     --resolution "${OPENUG2_RESOLUTION:-640x480}" \
+    --scene-resolution "${OPENUG2_SCENE_RESOLUTION:-320x240}" \
+    --headlight-shadows "${OPENUG2_HEADLIGHT_SHADOWS:-fast}" \
+    --world-shader "${OPENUG2_WORLD_SHADER:-legacy}" \
+    --world-order "${OPENUG2_WORLD_ORDER:-legacy}" \
     --tier "${OPENUG2_TIER:-baseline}" \
     --load-radius "${OPENUG2_LOAD_RADIUS:-500}" \
     --view-distance "${OPENUG2_VIEW_DISTANCE:-450}" \
@@ -110,6 +121,13 @@ set -- "$DATA" \
     --hud --hud-fit "${OPENUG2_HUD_FIT:-4:3}" \
     ${OPENUG2_ARGS:-}
 
+if [ "${OPENUG2_PERF_MONITOR:-0}" = 1 ] && [ "${OPENUG2_COMPARE:-0}" != 1 ]; then
+    set -- "$@" --perf-csv "$STATE_DIR/performance.csv"
+    export OPENUG2_MEMORY_LOG="$STATE_DIR/memory.csv"
+    : > "$OPENUG2_MEMORY_LOG"
+    echo "performance: frame timings in $STATE_DIR/performance.csv" >> "$LOG"
+fi
+
 echo "exec: $RUNDIR/nfsu2 $*" >> "$LOG"
 echo "OpenUG2: starting (state: $STATE_DIR)"
 
@@ -118,7 +136,7 @@ echo "OpenUG2: starting (state: $STATE_DIR)"
 sync
 
 # A hard reset previously left a NUL-filled tail on NTFS. During an input
-# trace, periodically flush tee's file from a separate process so a stuck GL
+# trace or performance capture, flush files from a separate process so a stuck GL
 # call cannot prevent the last completed watchdog lines reaching the card.
 MONITOR_SECONDS=0
 previous_arg=""
@@ -135,13 +153,15 @@ stop_log_sync() {
     fi
 }
 trap stop_log_sync EXIT
-if [[ "$MONITOR_SECONDS" =~ ^[0-9]+$ ]] && (( 10#$MONITOR_SECONDS > 0 && 10#$MONITOR_SECONDS <= 3600 )); then
-    MONITOR_SECONDS=$((10#$MONITOR_SECONDS))
+if [ "${OPENUG2_PERF_MONITOR:-0}" = 1 ] || { [[ "$MONITOR_SECONDS" =~ ^[0-9]+$ ]] && (( 10#$MONITOR_SECONDS > 0 && 10#$MONITOR_SECONDS <= 3600 )); }; then
+    if [[ "$MONITOR_SECONDS" =~ ^[0-9]+$ ]]; then MONITOR_SECONDS=$((10#$MONITOR_SECONDS)); else MONITOR_SECONDS=0; fi
     (
         elapsed=0
-        while (( elapsed < MONITOR_SECONDS )) && kill -0 "$$" 2>/dev/null; do
+        while { [ "${OPENUG2_PERF_MONITOR:-0}" = 1 ] || (( elapsed < MONITOR_SECONDS )); } && kill -0 "$$" 2>/dev/null; do
             sleep 3
-            sync "$LOG" "$STATE_DIR/resource.log" "$STATE_DIR/system-before.log" 2>/dev/null || sync "$LOG" 2>/dev/null || sync
+            if [ "${OPENUG2_COMPARE:-0}" = 1 ]; then sync; else
+                sync "$LOG" "$STATE_DIR/resource.log" "$STATE_DIR/performance.csv" "$STATE_DIR/memory.csv" "$STATE_DIR/system-before.log" 2>/dev/null || sync "$LOG" 2>/dev/null || sync
+            fi
             elapsed=$((elapsed + 3))
         done
     ) &
@@ -149,6 +169,11 @@ if [[ "$MONITOR_SECONDS" =~ ^[0-9]+$ ]] && (( 10#$MONITOR_SECONDS > 0 && 10#$MON
 fi
 
 run_game() {
+    if [ "${OPENUG2_COMPARE:-0}" = 1 ]; then
+        . "$PORTDIR/performance-comparison.sh"
+        run_performance_comparison "$@"
+        return $?
+    fi
     if [ "${OPENUG2_RESOURCE_MONITOR:-0}" = 1 ] && [ -r "$PORTDIR/runtime-diagnostics.sh" ]; then
         . "$PORTDIR/runtime-diagnostics.sh"
         run_monitored_engine "$@"
@@ -171,7 +196,7 @@ sync "$LOG" 2>/dev/null || sync
 rm -f "$RUNDIR/nfsu2"
 
 # If state had to live in $HOME, leave a copy where it is easy to find.
-if [ "$STATE_DIR" != "$PORTDIR" ]; then
+if [ "$STATE_DIR" != "$PORTDIR" ] && [ "${OPENUG2_COMPARE:-0}" != 1 ]; then
     cp -f "$LOG" "$PORTDIR/last-run.log" 2>/dev/null
 fi
 exit "$STATUS"

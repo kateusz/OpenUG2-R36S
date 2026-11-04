@@ -421,7 +421,6 @@ typedef struct {
     N2PhysicsAttr physics; int has_physics;
     uint32_t tex_keys[128]; RhiTexture textures[128];
     char alpha[128], mode[128]; int ntextures;
-    CarShadow shadow;
     float body_floor; /* car_body_floor of scene: immutable after load */
 } CarSwitchCandidate;
 
@@ -429,7 +428,6 @@ static int car_body_metrics(const N2Scene *car, float bb[6], float bloom[4][4]);
 
 static void car_switch_release(CarSwitchCandidate *candidate) {
     if (!candidate) return;
-    free_car_shadow(&candidate->shadow);
     free_scene_gpu(candidate->gpu, candidate->nmesh);
     n2_free_scene(&candidate->scene);
     for (int i = 0; i < candidate->ntextures; i++)
@@ -574,12 +572,18 @@ static int car_body_metrics(const N2Scene *car, float bb[6], float bloom[4][4]) 
  * Every entry point is a no-op unless the CSV is open. */
 enum { PF_FRAME_TOP, PF_PLAYER_SIM, PF_AI_FOLLOW, PF_AI_STEP, PF_AI_CONTACT,
        PF_AI_SPAWN, PF_CAMERA, PF_WORLD_DRAW, PF_CAR_SHADOW, PF_PLAYER_DRAW,
-       PF_AI_DRAW, PF_MID_DRAW, PF_AI_LAMPS, PF_POST_DRAW, PF_SWAP, PF_N };
+       PF_AI_DRAW, PF_MID_DRAW, PF_AI_LAMPS, PF_POST_DRAW, PF_GPU_DRAIN, PF_SWAP, PF_AUX, PF_COMPOSITE, PF_HUD, PF_N };
 static const char *const pf_name[PF_N] = { "top","player_sim","ai_follow","ai_step",
     "ai_contact","ai_spawn","camera","world_draw","car_shadow","player_draw",
-    "ai_draw","mid_draw","ai_lamps","post_draw","swap" };
+    "ai_draw","mid_draw","ai_lamps","post_draw","gpu_drain","swap","aux","composite","hud" };
+static const char *const pf_head_names[]={"reference","filtered","fast","off"};
+static int pf_display_w,pf_display_h,pf_scene_w,pf_scene_h,pf_scene_requested_w,pf_scene_requested_h;
+static int pf_head_profile,pf_world_requested,pf_order_requested,pf_world_effective,pf_order_effective,pf_shader_fallbacks;
+static double pf_queue_ms;
+static int pf_head_effective;
 #define PF_GPU_N 3      /* scene before AI cars | AI car meshes | rest to swap */
 #define PF_GPU_LAG 4
+static clock_t pf_cpu_start; static Uint64 pf_frame_start, pf_flush;
 static FILE *pf_csv; static Uint64 pf_last; static double pf_ms[PF_N];
 static int pf_gpu_ok; static RhiTimer pf_q[PF_GPU_LAG][PF_GPU_N]; static int pf_gpu_open=-1;
 static void pf_mark(int s) {
@@ -604,8 +608,10 @@ static void pf_open(const char *path) {
     fprintf(pf_csv,"frame,traffic,racers,target,ai_visible,draws,contact_passes,pair_checks,"
                    "pair_hits,world_fixes,wall_candidates,spawn_attempts,spawn_checks");
     for(int s=0;s<PF_N;s++)fprintf(pf_csv,",cpu_%s",pf_name[s]);
-    fprintf(pf_csv,",cpu_total,gpu_lag_frame,gpu_scene,gpu_ai_cars,gpu_rest,gpu_total\n");
-    pf_last=SDL_GetPerformanceCounter();
+    fprintf(pf_csv,",cpu_total,frame_ms,process_cpu_ms,gpu_lag_frame,gpu_scene,gpu_ai_cars,gpu_rest,gpu_total,display_width,display_height,scene_width,scene_height,scene_requested_width,scene_requested_height,headlight_profile,headlight_effective,headlight_size,headlight_samples,headlight_caster_draws,world_shader_requested,world_shader_effective,world_order_requested,world_order_effective,shader_fallbacks,cpu_queue,program_changes,texture_changes,state_changes\n");
+    fflush(pf_csv);
+    pf_flush=pf_frame_start=pf_last=SDL_GetPerformanceCounter();
+    pf_cpu_start=clock();
 }
 static void pf_row(long frame,const int counts[13]) {
     if(!pf_csv)return;
@@ -613,7 +619,10 @@ static void pf_row(long frame,const int counts[13]) {
     fprintf(pf_csv,"%ld",frame);
     for(int i=1;i<13;i++)fprintf(pf_csv,",%d",counts[i]);
     for(int s=0;s<PF_N;s++){fprintf(pf_csv,",%.4f",pf_ms[s]);total+=pf_ms[s];pf_ms[s]=0;}
-    fprintf(pf_csv,",%.4f",total);
+    Uint64 now=SDL_GetPerformanceCounter();
+    fprintf(pf_csv,",%.4f,%.4f,%.4f",total,
+            (double)(now-pf_frame_start)*1000.0/SDL_GetPerformanceFrequency(),
+            (double)(clock()-pf_cpu_start)*1000.0/CLOCKS_PER_SEC);
     double g[PF_GPU_N]={0};int have=0;
     if(pf_gpu_ok && frame>=PF_GPU_LAG-1) {   /* oldest ring slot: written PF_GPU_LAG-1 frames ago */
         long old=frame-(PF_GPU_LAG-1);have=1;
@@ -622,9 +631,18 @@ static void pf_row(long frame,const int counts[13]) {
             if(!rhi_timer_read(pf_q[old%PF_GPU_LAG][k],&ns)){have=0;break;}
             g[k]=ns/1e6;
         }
-        if(have)fprintf(pf_csv,",%ld,%.4f,%.4f,%.4f,%.4f\n",old,g[0],g[1],g[2],g[0]+g[1]+g[2]);
+        if(have)fprintf(pf_csv,",%ld,%.4f,%.4f,%.4f,%.4f",old,g[0],g[1],g[2],g[0]+g[1]+g[2]);
     }
-    if(!have)fprintf(pf_csv,",,,,,\n");
+    if(!have)fprintf(pf_csv,",,,,,");
+    RhiFrameStats st=rhi_frame_stats();
+    fprintf(pf_csv,",%d,%d,%d,%d,%d,%d,%s,%s,%d,%d,%d,%s,%s,%s,%s,%d,%.4f,%u,%u,%u\n",
+        pf_display_w,pf_display_h,pf_scene_w,pf_scene_h,pf_scene_requested_w,pf_scene_requested_h,
+        pf_head_names[pf_head_profile],pf_head_effective?pf_head_names[pf_head_profile]:"unshadowed",
+        !pf_head_effective?0:pf_head_profile==0?512:256,!pf_head_effective?0:pf_head_profile==2?1:4,g_dbg.headlight_shadow_draws,
+        pf_world_requested?"auto":"legacy",pf_world_effective?"auto":"legacy",
+        pf_order_requested?"depth":"legacy",pf_order_effective?"depth":"legacy",pf_shader_fallbacks,pf_queue_ms,
+        st.program_changes,st.texture_changes,st.state_changes);
+    if(now-pf_flush >= SDL_GetPerformanceFrequency()) { fflush(pf_csv); pf_flush=now; }
 }
 
 /* Conservative whole-vehicle visibility: a world-space sphere against the six
@@ -2305,6 +2323,7 @@ static PauseMenu *pause_menu_build(const char *dataroot, StGraphics *gfx, StGfxC
 }
 
 int main(int argc, char **argv) {
+    if (getenv("OPENUG2_MEMORY_LOG")) setvbuf(stdout,NULL,_IOLBF,0);
     collide_walls_selftest();
     phys_selftest();
     world_ground_selftest();
@@ -2325,7 +2344,10 @@ int main(int argc, char **argv) {
          --pause-events S deterministic timed UI events, e.g. 800:Right,880:Left
          --pause-off FILE save same-frame frozen scene-only pair before UI
          --pause-reference capture independent populated authored reference with UI replay
-         --resolution WxH window/render size (default 1920x1080; also used by audits)
+         --resolution WxH display/window size (default 1920x1080; also used by audits)
+         --scene-resolution native|WxH GLES scene target; bilinear upscale, native HUD
+         --headlight-shadows reference|filtered|fast|off (default reference)
+         --world-shader auto|legacy --world-order depth|legacy (defaults legacy)
          --load-radius M  initial world residency radius in metres (default 1400)
          --view-distance M  drawing distance in metres (default tier-derived)
          --carinfo CAR    dump CAR's part list + texture catalog and exit (GL-free)
@@ -2451,6 +2473,8 @@ int main(int argc, char **argv) {
     const char *perf_csv = NULL;  /* --perf-csv FILE: per-frame section timings */
     int world_cull_off = 0; /* diagnostic A/B, never changes loading or shadows */
     int perf_still = 0;           /* --perf-still: no --shot auto-throttle */
+    int perf_finish = 0, perf_vsync = -1, perf_half_pixels = 0, perf_scale_set = 0;
+    int scene_width=0,scene_height=0,head_profile=0,world_shader_auto=0,world_order_depth=0;
     int collision_source = WCOLLISION_BUN;
     float perf_orbit = 0.0f;      /* --perf-orbit RAD: orbit camera step per frame */
     N2Path ai_drive_path = {0}; AiDrive ai_drive = {0}; int ai_audit_complete = 0;
@@ -2715,6 +2739,43 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--follow-roam-ai")) follow_roam_ai = 1;
         else if (!strcmp(argv[i], "--perf-csv") && i+1 < argc) perf_csv = argv[++i];
         else if (!strcmp(argv[i], "--perf-still")) perf_still = 1;
+        else if (!strcmp(argv[i], "--perf-finish")) perf_finish = 1;
+        else if (!strcmp(argv[i], "--perf-vsync")) {
+            if (i+1>=argc || (strcmp(argv[i+1],"0") && strcmp(argv[i+1],"1"))) {
+                fprintf(stderr,"--perf-vsync requires 0 or 1\n");return 2;
+            }
+            perf_vsync=argv[++i][0]-'0';
+        }
+        else if (!strcmp(argv[i], "--scene-resolution")) {
+            char extra;
+            if(i+1>=argc){fprintf(stderr,"--scene-resolution requires native or WIDTHxHEIGHT\n");return 2;}
+            const char *v=argv[++i];
+            if(!strcmp(v,"native"))scene_width=scene_height=0;
+            else if(strspn(v,"0123456789x")!=strlen(v) ||
+                    sscanf(v,"%4dx%4d%c",&scene_width,&scene_height,&extra)!=2 ||
+                    scene_width<64 || scene_height<64 || scene_width>7680 || scene_height>4320) {
+                fprintf(stderr,"--scene-resolution requires native or WIDTHxHEIGHT (64..7680 x 64..4320)\n");return 2;
+            }
+        }
+        else if (!strcmp(argv[i], "--headlight-shadows")) {
+            if(i+1>=argc){fprintf(stderr,"--headlight-shadows requires reference|filtered|fast|off\n");return 2;}
+            const char *v=argv[++i];head_profile=!strcmp(v,"reference")?0:!strcmp(v,"filtered")?1:!strcmp(v,"fast")?2:!strcmp(v,"off")?3:-1;
+            if(head_profile<0){fprintf(stderr,"invalid headlight profile\n");return 2;}
+        }
+        else if (!strcmp(argv[i], "--world-shader") || !strcmp(argv[i], "--world-order")) {
+            int shader=!strcmp(argv[i],"--world-shader");
+            if(i+1>=argc){fprintf(stderr,"missing world mode\n");return 2;}
+            const char *v=argv[++i];
+            if(strcmp(v,"legacy") && strcmp(v,shader?"auto":"depth")){fprintf(stderr,"invalid world mode\n");return 2;}
+            if(shader)world_shader_auto=strcmp(v,"legacy")!=0;else world_order_depth=strcmp(v,"legacy")!=0;
+        }
+        else if (!strcmp(argv[i], "--perf-pixel-scale")) {
+            if (i+1>=argc || (strcmp(argv[i+1],"1") && strcmp(argv[i+1],"0.5"))) {
+                fprintf(stderr,"--perf-pixel-scale requires 1 or 0.5\n");return 2;
+            }
+            perf_half_pixels=!strcmp(argv[++i],"0.5");
+            perf_scale_set=1;
+        }
         else if (!strcmp(argv[i], "--traffic-cull-off")) g_dbg.traffic_cull_off = 1;
         else if (!strcmp(argv[i], "--perf-orbit") && i+1 < argc) perf_orbit = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--traffic") && i+1 < argc) {
@@ -2946,6 +3007,19 @@ int main(int argc, char **argv) {
                        "not interactive/race/alternate-spawn modes\n");
         return 2;
     }
+    if(scene_width && perf_scale_set){fprintf(stderr,"--perf-pixel-scale cannot be combined with scene scaling\n");return 2;}
+#ifndef N2_GLES
+    if(scene_width || world_shader_auto){fprintf(stderr,"scene scaling and specialized world shading require the GLES build\n");return 2;}
+#endif
+    if ((perf_finish || perf_vsync>=0 || perf_scale_set) && !perf_csv) {
+        fprintf(stderr,"performance controls require --perf-csv\n");return 2;
+    }
+#ifdef N2_VULKAN
+    if(head_profile){fprintf(stderr,"headlight profiles require GL/GLES\n");return 2;}
+    if (perf_finish || perf_vsync>=0 || perf_scale_set) {
+        fprintf(stderr,"performance presentation controls require GL/GLES\n");return 2;
+    }
+#endif
     if (instance_audit && !world2) {
         fprintf(stderr, "--instance-audit requires one STREAM bundle\n");
         return 2;
@@ -4047,6 +4121,9 @@ int main(int argc, char **argv) {
     /* Hidden, fixed-size capture windows avoid the desktop's visible-window
        size clamp (notably macOS), using the same production GL draw path. */
     const int capture_window = shot || raudit || resident_route_audit;
+    /* Presentation comparisons must use a visible window, including KMSDRM:
+     * a hidden capture can bypass the display path being measured. */
+    const int hidden_capture = capture_window && perf_vsync<0 && !perf_scale_set && !perf_finish;
     uint32_t window_flags = rhi_window_flags(RHI_BACKEND_DEFAULT);
 #ifdef N2_VULKAN
     /* Headless SDL drivers cannot create a Vulkan surface; desktop drivers keep presentation. */
@@ -4061,13 +4138,18 @@ int main(int argc, char **argv) {
     SDL_Window *win = SDL_CreateWindow("OpenUG2",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, render_width, render_height,
         window_flags |
-        (capture_window ? SDL_WINDOW_HIDDEN : SDL_WINDOW_RESIZABLE));
+        (hidden_capture ? SDL_WINDOW_HIDDEN : SDL_WINDOW_RESIZABLE));
     if (!win) { fprintf(stderr,"window: %s\n",SDL_GetError()); return 1; }
     /* The device also sets tightly packed readback rows (odd-width captures)
        and the swap interval: audits pace explicitly, so no vsync for them. */
-    { RhiDeviceDesc dev = { RHI_BACKEND_DEFAULT,
-                            (shot || ai_drive_audit) ? 0u : (uint32_t)RHI_DEVICE_VSYNC, win };
-      if (rhi_device_create(&dev) != RHI_OK) return 1; }
+    { int vsync=perf_vsync>=0?perf_vsync:!(shot || ai_drive_audit);
+      RhiDeviceDesc dev = { RHI_BACKEND_DEFAULT, vsync ? (uint32_t)RHI_DEVICE_VSYNC : 0u, win };
+      if (rhi_device_create(&dev) != RHI_OK) return 1;
+#ifndef N2_VULKAN
+      printf("presentation: requested-vsync=%d actual-swap-interval=%d finish-before-swap=%d pixel-scale=%s\n",
+             vsync,SDL_GL_GetSwapInterval(),perf_finish,perf_half_pixels?"0.5":"1");
+#endif
+    }
     const RhiCaps *caps = rhi_caps();
     { int32_t dw,dh; const int32_t *limit = caps->max_viewport;
       rhi_drawable_size(&dw,&dh);
@@ -4110,18 +4192,28 @@ int main(int argc, char **argv) {
     dbgui_init(win, SDL_GL_GetCurrentContext());
 #endif
 
-    RProg rp = render_program();
+    RProg rp = render_program_variant(head_profile,0);
+    RProg world_rp={0}; UG2WorldPipelines world_fast_pipe={0};
+#ifdef N2_GLES
+    if(world_shader_auto) {
+        world_rp=render_program_variant(head_profile,1);
+        if(world_rp.shader.id)render_world_pipelines(&world_rp,&world_fast_pipe);
+        else fprintf(stderr,"specialized world shader unavailable; using legacy\n");
+    }
+#endif
+    SceneTarget scene_target={0}; WorldDrawQueue world_queue={0};
+    printf("render requested scene=%dx%d (0=native) headlights=%s world-shader=%s world-order=%s vehicle-shadows=removed depth24=%d\n",
+        scene_width,scene_height,pf_head_names[head_profile],world_shader_auto?"auto":"legacy",world_order_depth?"depth":"legacy",rhi_caps()->depth24_target);
     UG2WorldPipelines wpipe;   /* sky, vista and world passes */
     render_world_pipelines(&rp, &wpipe);
     UG2CarPipelines cpipe;     /* car bodies, glass, lamp halos */
     render_car_pipelines(&rp, &cpipe);
     const UG2OverlayPipelines *ovp = render_overlay_pipelines(&rp);   /* HUD, menu, nitro */
-    HeadlightShadows headlight_shadows = {0};
+    HeadlightShadows headlight_shadows = {.size=head_profile==1 || head_profile==2?256:512};
     RhiBuffer rain_vbo = {0};
     RhiBuffer wall_debug_vbo = {0};
     RoadReflections road_reflections = {0};
     CarEnvironment car_environment={0};
-    CarShadow player_shadow={0},opponent_shadow={0};
 
     /* Per-mesh track textures: each mesh's diffuse key (0x134012) resolves to a
        texture in the region's own STREAM TPK (grass/road/props) or the shared
@@ -6651,6 +6743,7 @@ int main(int argc, char **argv) {
     while (running) {
         if (input_monitor.duration) SDL_AtomicAdd(&input_monitor.frames, 1);
         im_phase(&input_monitor, IM_WORLD);
+        if(pf_csv) { pf_frame_start=SDL_GetPerformanceCounter(); pf_cpu_start=clock(); }
         pf_mark(PF_FRAME_TOP);
         uint32_t resident_frame_begin = SDL_GetTicks();
         Uint64 resident_frame_counter = SDL_GetPerformanceCounter();
@@ -7189,6 +7282,9 @@ int main(int argc, char **argv) {
                     world_resident_free(candidate_resident);
                     candidate_resident = NULL;
                 }
+                world_resident_free(retired_resident);
+                retired_resident = NULL;
+                world_texture_cache_trim(0);
                 int ok = fabsf(PHYS_KMH(speed)) <= 1.0f &&
                     prepare_map_switch(troot, next_track, scenery_preview_set?scenery_event:-1,
                                        sky_profile, &resident_policy,
@@ -7453,12 +7549,27 @@ int main(int argc, char **argv) {
                 WResidentBuildTiming build_timing = {0};
                 int build_status = 0; /* pending is not a failed build */
                 if (!background) {
-                    candidate_resident = calloc(1, sizeof *candidate_resident);
-                    build_status = candidate_resident &&
-                        world_resident_build(candidate_resident, &resident_args,
+                    /* A race can request a synchronous move while a free-roam
+                     * worker is outstanding. Join it before entering the
+                     * single-loader parser; reuse a completed matching owner. */
+                    world_resident_job_cancel(&resident_job);
+                    world_resident_free(retired_resident);
+                    retired_resident = NULL;
+                    world_texture_cache_trim(0);
+                    if (prepared_status) {
+                        candidate_resident = prepared;prepared = NULL;
+                        build_timing = prepared_timing;
+                        build_status = prepared_status > 0 &&
+                            world_resident_finish(candidate_resident,carpos[0],
+                                carpos[1],carpos[2],&build_timing) ? 1 : -1;
+                    } else {
+                        candidate_resident = calloc(1, sizeof *candidate_resident);
+                        build_status = candidate_resident &&
+                            world_resident_build(candidate_resident, &resident_args,
                                           target[0], target[1],
                                           carpos[0], carpos[1], carpos[2],
                                           &build_timing) ? 1 : -1;
+                    }
                 } else if (candidate_resident || prepared_status) {
                     if (!candidate_resident) {
                         candidate_resident = prepared;
@@ -7474,6 +7585,11 @@ int main(int argc, char **argv) {
                     finish_frames++; finish_total_ms += elapsed;
                     if (elapsed > finish_peak_ms) finish_peak_ms = elapsed;
                 } else if (!resident_job) {
+                    /* Bound overlap to active + candidate, including GPU owners.
+                     * An old retirement backlog must not accompany a new load. */
+                    world_resident_free(retired_resident);
+                    retired_resident = NULL;
+                    world_texture_cache_trim(0);
                     resident_wait_frames = 0;
                     if (!world_resident_job_start(&resident_job, &resident_args,
                                                   target[0], target[1]))
@@ -9257,6 +9373,18 @@ int main(int argc, char **argv) {
             continue;
         }
         int W = frame.width, H = frame.height;
+        int scaled_scene=0;
+        pf_display_w=W;pf_display_h=H;pf_scene_w=W;pf_scene_h=H;
+        pf_scene_requested_w=scene_width;pf_scene_requested_h=scene_height;
+        pf_head_profile=head_profile;pf_world_requested=world_shader_auto;pf_order_requested=world_order_depth;
+        pf_world_effective=world_shader_auto && world_rp.shader.id;
+        pf_order_effective=0;pf_shader_fallbacks=0;pf_queue_ms=0;
+        if (perf_half_pixels) {
+            W/=2;H/=2;
+            if(rhi_profile_main_size(W,H)!=RHI_OK) {
+                fprintf(stderr,"profiling frame size failed\n");final_status=1;running=0;break;
+            }
+        }
         pf_mark(PF_CAMERA); pf_gpu(pf_frame,0);
         /* the sky is cleared to the fog colour: distant geometry dissolves
            into exactly what the horizon shows */
@@ -9406,9 +9534,18 @@ int main(int argc, char **argv) {
                           long_beam?g_dbg.high_beam_range:g_dbg.low_beam_range,
                           ncar && !follow_roam_ai && race_state!=3 && g_dbg.show_lights && headlights_on
                           ? g_dbg.headlight_gain*light_variant_gain(carcfg.parts[N2_PART_HEADLIGHT]) : 0.0f);
-        g_dbg.headlight_shadow_draws = g_dbg.headlight_shadows
+        g_dbg.headlight_shadow_draws = g_dbg.headlight_shadows && head_profile!=3
             ? render_headlight_shadows(&rp,&headlight_shadows,wbatch,nbatch) : 0;
 
+        pf_head_effective=rp.p->uHeadShadow>.5f;
+        pf_mark(PF_AUX);
+        if(scene_width && (scene_width!=frame.width || scene_height!=frame.height)) {
+            scaled_scene=render_scene_begin(&scene_target,scene_width,scene_height,
+                (const float[4]){g_dbg.fog_r,g_dbg.fog_g,g_dbg.fog_b,1});
+            /* W/H remain display coordinates for projection and screen effects.
+               The pass viewport alone selects scene raster dimensions. */
+        }
+        pf_scene_w=scaled_scene?scene_width:W;pf_scene_h=scaled_scene?scene_height:H;
         /* M132-R: ONE reset for the whole frame, before any pass. The old reset
            sat between the vista and world passes and silently discarded every
            sky and vista draw from the total. */
@@ -9421,8 +9558,8 @@ int main(int argc, char **argv) {
            colour as the conservative fallback. */
         if (nsky && (passmode == 0 || passmode == 3 || passbatch >= 0)) {   /* M78/M79 */
             float MVPsky[16], Psky[16];
-            if(gcam_on)cam_projection(arg_cam_projection,gcam_pose.fov_bau,W,H,GAMECAM_MAIN_VIEW_SCALING,znear,30000.0f,Psky);
-            else mat_persp(0.9f, (float)W/H, znear, 30000.0f, Psky);
+            if(gcam_on)cam_projection(arg_cam_projection,gcam_pose.fov_bau,frame.width,frame.height,GAMECAM_MAIN_VIEW_SCALING,znear,30000.0f,Psky);
+            else mat_persp(0.9f, (float)frame.width/frame.height, znear, 30000.0f, Psky);
             mat_mul(Psky, V, MVPsky);
             ug2_copy(rp.p->uMVP, MVPsky, 16);
             rp.p->uUnlit = 0.0f;
@@ -9496,7 +9633,7 @@ int main(int argc, char **argv) {
         if (nvista && tier == 2 && g_dbg.show_track && (passmode == 0 || passmode == 1)) {
             const float VISTA_MINCONTRIB = 0.35f;
             float Pv[16], MVPv[16];
-            mat_persp(0.9f, (float)W/H, znear, vista_far, Pv);
+            mat_persp(0.9f, (float)frame.width/frame.height, znear, vista_far, Pv);
             mat_mul(Pv, V, MVPv);
             ug2_copy(rp.p->uMVP, MVPv, 16);
             float vd = vista_far > 1.0f
@@ -9628,8 +9765,11 @@ int main(int argc, char **argv) {
         }
         int ndefblend = 0, ndefadd = 0;
         if (g_debug_mode == 0 || !dbgshader.id) {   /* --- default textured world pass --- */
-        RhiTexture lasttex = {UINT32_MAX};
-        int lastmode = -1;
+        Uint64 queue_start=SDL_GetPerformanceCounter();
+        int have_queue=render_world_queue_reserve(&world_queue,nbatch);
+        world_queue.count=0;
+        rp.p->uVColor=g_dbg.vcolor;
+        if(world_rp.shader.id)*world_rp.p=*rp.p; /* canonical frame state; separate parameter storage */
         rp.p->uVColor = g_dbg.vcolor;   /* apply source prelight to world geom */
         rhi_cmd_bind_pipeline(wpipe.opaque);
         for (int k = 0; g_dbg.show_track && (passmode == 0 || passmode == 1) && k < nbatch; k++) {
@@ -9678,24 +9818,31 @@ int main(int argc, char **argv) {
                 }
                 continue;   /* drawn in the deferred pass below, not here */
             }
-            ndrawn += b->nmesh;
-            if (b->tex.id != lasttex.id) {
-                if (b->tex.id) { rp.p->uUseTex = 1.0f; rhi_cmd_bind_texture(0, b->tex); }
-                else { rp.p->uUseTex = 0.0f; ug2_vec3(rp.p->uColor, 0.28f, 0.29f, 0.31f); }
-                lasttex = b->tex;
+            if(have_queue)render_world_queue_push(&world_queue,b,k,cam);
+            else {
+                pf_shader_fallbacks+=render_world_batch(&rp,&world_rp,&wpipe,&world_fast_pipe,b,
+                    g_dbg.road_wetness,world_shader_auto);
+                ndrawn+=b->nmesh;g_dbg.drawn++;wbdrawn++;
+                for(int sc=0;sc<8;sc++)vis_scen[sc]+=b->scen_count[sc];
+                if(nviskept<4096)viskept[nviskept++]=k;
             }
-            if (b->drawmode != lastmode) {
-                rp.p->uAlphaTest = b->drawmode == N2_DRAW_CUTOUT ? 1.0f : 0.0f;
-                lastmode = b->drawmode;
-            }
-            rp.p->uWetness = b->wettable ? g_dbg.road_wetness : 0;
-            render_draw_batch(b);
-            for (int sc=0; sc<8; sc++) vis_scen[sc] += b->scen_count[sc];
-            g_dbg.drawn++; wbdrawn++;
-            if (nviskept < 4096) viskept[nviskept++] = k;
         }
+        if(have_queue) {
+            if(world_order_depth)render_world_queue_sort(&world_queue);
+            pf_order_effective=world_order_depth;
+            pf_queue_ms=(double)(SDL_GetPerformanceCounter()-queue_start)*1000.0/SDL_GetPerformanceFrequency();
+            for(int q=0;q<world_queue.count;q++) {
+                int k=world_queue.entries[q].index;N2Batch *b=&wbatch[k];
+                pf_shader_fallbacks+=render_world_batch(&rp,&world_rp,&wpipe,&world_fast_pipe,b,
+                    g_dbg.road_wetness,world_shader_auto);
+                ndrawn+=b->nmesh;g_dbg.drawn++;wbdrawn++;
+                for(int sc=0;sc<8;sc++)vis_scen[sc]+=b->scen_count[sc];
+                if(nviskept<4096)viskept[nviskept++]=k;
+            }
+        }
+        rhi_cmd_bind_pipeline(wpipe.opaque);
         rp.p->uWetness = 0;
-        if (lastmode == N2_DRAW_CUTOUT) rp.p->uAlphaTest = 0.0f;
+        rp.p->uAlphaTest = 0.0f;
         /* Deferred pass: authored blended/additive world batches. Depth test
            stays on (correct occlusion by real opaque geometry) but depth
            write is off (a translucent/glow surface must not occlude what's
@@ -9792,46 +9939,13 @@ int main(int argc, char **argv) {
         }
 
         pf_mark(PF_WORLD_DRAW);
-        /* Low detail uses a cheap square footprint. Medium/High draw actual
-           model silhouettes with the current body/wheel transforms below. */
+        /* Vehicle shadows are removed; emissive underglow remains. */
         if (ncar) {
-            rhi_cmd_bind_pipeline(cpipe.glass);   /* alpha blend, depth tested, no write */
-            rp.p->uUnlit = 1.0f; rp.p->uUseTex = 0.0f; rp.p->uSoft = 0.0f;
-            ug2_vec3(rp.p->uColor, 0.0f, 0.0f, 0.0f); rp.p->uAlpha = 0.5f;
-            for (int c=0; g_dbg.vehicle_quality<=0 && c<=draw_nai; c++) {
-                if((c==0 && player_hidden) ||
-                   (c>0 && !ai_actor_present(c-1,ai_race,nai,traffic_routes)) ||
-                   (c>0 && !render_ais[c-1].render_visible))continue;
-                float *cp = c==0 ? render_player.pos : render_ais[c-1].pos;
-                WGroundHit ground;
-                if(world_ground_hit(&scene,cp[0],cp[1],cp[2],&ground)==WSURF_NONE)continue;
-                const float *bb=carbb;
-                float opponent_bb[6];
-                if(c>0) {
-                    int visual=ai_race && world.city.race.active?ai_event_visual(c-1):ai_traffic_visual(c-1);
-                    if((!ai_race || world.city.race.active) && traffic[visual].gpu)bb=traffic[visual].bb;
-                    else {
-                        for(int a=0;a<3;a++) {
-                            opponent_bb[a]=opponent_profile.body[a*2];
-                            opponent_bb[a+3]=opponent_profile.body[a*2+1];
-                        }
-                        bb=opponent_bb;
-                    }
-                }
-                float gp[3]={cp[0],cp[1],ground.z},M[16];
-                mat_car_footprint(gp,c==0?render_player.head:render_ais[c-1].head,ground.normal,
-                                  bb,1.10f,1.35f,.03f,M);
-                float MV[16]; mat_mul(MVP,M,MV);
-                ug2_copy(rp.p->uMVP, MV, 16); render_draw_gpumesh(&quad);
-                g_dbg.drawn++;
-            }
-            rp.p->uAlpha = 1.0f; rp.p->uSoft = 0.0f;
-
             /* neon underglow: an additive coloured pool on the asphalt under
                the chassis. Additive (not alpha) so it reads as emitted light
                on dark tarmac rather than paint, uSoft so it falls off round
                the edges, and sized from the same body AABB the shadow uses so
-               it tracks the car's real footprint. Drawn after the shadow so it
+               it tracks the car's real footprint. Drawn before the car so it
                lights the ground the shadow just darkened. */
             if (!player_hidden && g_dbg.neon_on && g_dbg.neon_str > 0.001f) {
                 rhi_cmd_bind_pipeline(cpipe.halo);   /* additive, depth tested, no write */
@@ -9849,7 +9963,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        pf_mark(PF_CAR_SHADOW);
+        pf_mark(PF_WORLD_DRAW);
         /* Tire marks (TM-11): textured strip quads on the ground. Textureless or
            unloaded surfaces store strips but draw nothing. */
         {
@@ -10005,15 +10119,7 @@ int main(int argc, char **argv) {
                 mat_mul(WheelModel,wheelT[k],wheelWorld[k]);
                 mat_mul(WheelModel,brakeT[k],brakeWorld[k]);
             }
-            WGroundHit shadow_ground;
-            if(!player_hidden && world_ground_hit(&scene,render_player.pos[0],render_player.pos[1],render_player.pos[2],&shadow_ground)!=WSURF_NONE) {
-                float gp[3]={render_player.pos[0],render_player.pos[1],shadow_ground.z};
-                const N2Scene *rims=nwheelgm>0 && (wheel_brand!=0 || wheel_style!=1)?&wheellib:NULL;
-                int casts=render_car_shadow(&rp,&player_shadow,&car,cgm,stock_wheel,rims,wheelgm,
-                    Model,(const float (*)[16])wheelWorld,MVP,gp,shadow_ground.normal,g_dbg.vehicle_quality);
-                if(casts>0)g_dbg.drawn+=casts;
-                ug2_copy(rp.p->uMVP, MVPc, 16);render_model(&rp,Model);
-            }
+            ug2_copy(rp.p->uMVP, MVPc, 16);render_model(&rp,Model);
             float *pnt = g_dbg.paint_override ? g_dbg.paint : paint;
             int brake_lights=stage1_active
                 ? g_stage1.drivetrain.brake>.1f || handbrake
@@ -10268,14 +10374,6 @@ int main(int argc, char **argv) {
                 for(int w=0;w<4;w++){
                     mat_mul(AIWheelModel,aiWheelT[w],aiWheelWorld[w]);
                     mat_mul(AIWheelModel,aiBrakeT[w],aiBrakeWorld[w]);
-                }
-                WGroundHit shadow_ground;
-                if(world_ground_hit(&scene,render_ais[k].pos[0],render_ais[k].pos[1],render_ais[k].pos[2],&shadow_ground)!=WSURF_NONE) {
-                    float gp[3]={render_ais[k].pos[0],render_ais[k].pos[1],shadow_ground.z};
-                    CarShadow *cache=tv?&traffic[visual].shadow:&opponent_shadow;
-                    int casts=render_car_shadow(&rp,cache,draw_scene,draw_gpu,draw_stock_wheel,NULL,NULL,
-                        AIModel,(const float (*)[16])aiWheelWorld,MVP,gp,shadow_ground.normal,g_dbg.vehicle_quality);
-                    if(casts>0)g_dbg.drawn+=casts;
                 }
                 ug2_copy(rp.p->uMVP, AIMVPc, 16);
                 render_model(&rp,AIModel);
@@ -10809,6 +10907,12 @@ int main(int argc, char **argv) {
             (const float (*)[4])world.neighborhood.mbb,obstsrc,nobst,
             g_dbg.freecam?cam:render_player.pos,render_player.pos,MVP);
 
+        pf_mark(PF_POST_DRAW);
+        if(scaled_scene) {
+            render_scene_composite(&scene_target,(const float[4]){g_dbg.fog_r,g_dbg.fog_g,g_dbg.fog_b,1});
+            W=frame.width;H=frame.height;
+        }
+        pf_mark(PF_COMPOSITE);
         if(!hud && (world.city.race.active || (ai_race && race_state!=3))) {
             hud=hud_init(dataroot);
             if(hud){hud_configure(hud,&hud_settings);hud_set_preview(hud,hud_preview_opt);}
@@ -12000,9 +12104,7 @@ int main(int argc, char **argv) {
                 }
                 if (ug_gl_errors("pause-shot")) final_status = 1;
             }
-            unsigned char *px = malloc((size_t)W*H*3);
-            if (px && render_read_rgb(W, H, px)) write_png(shot, W, H, px);
-            free(px);
+            /* Final readback follows the frontend/pause UI below. */
             printf("frame avg: %.1f ms (vsync on), %d/%d world meshes drawn, %d draw calls\n",
                    (SDL_GetTicks()-t0)/(float)shotframe, ndrawn, nm, g_dbg.drawn);
             printf("TIER %s  cutoff %.1f m  far %.1f m\n",
@@ -12167,12 +12269,17 @@ int main(int argc, char **argv) {
             fed_draw(frontend_draw, &frontend, fw, fh);
         }
 #endif
-        if (pause_menu_is_open(pause_menu)) {
+        if (!pause_shot && pause_menu_is_open(pause_menu)) {
             int32_t pw, ph;
             rhi_drawable_size(&pw, &ph);
             pause_menu_draw(pause_menu, pw, ph);
         }
-        pf_mark(PF_POST_DRAW); pf_gpu(pf_frame,-1);
+        if(shot && shotframe>=shotframes && !capture_frame_png(shot,W,H))final_status=1;
+        pf_mark(PF_HUD); pf_gpu(pf_frame,-1);
+        if (perf_finish) {
+            if (rhi_profile_finish()!=RHI_OK) {fprintf(stderr,"profiling finish failed\n");running=0;final_status=1;}
+            pf_mark(PF_GPU_DRAIN);
+        }
         im_phase(&input_monitor, IM_PRESENT);
         rhi_frame_end();
         im_phase(&input_monitor, IM_IDLE);
@@ -12198,6 +12305,7 @@ int main(int argc, char **argv) {
         }
     }
 
+    if(pf_csv) { fclose(pf_csv); pf_csv=NULL; }
     race_log_stop(&race_log);g_dbg.race_log=NULL;
     if(drive_trace_file && fclose(drive_trace_file))
         fprintf(stderr,"Driving trace close failed: %s\n",drive_trace_path);
@@ -12274,10 +12382,11 @@ int main(int argc, char **argv) {
     world_texture_cache_clear();
     free_road_reflections(&road_reflections);
     free_car_environment(&car_environment);
-    free_car_shadow(&player_shadow);free_car_shadow(&opponent_shadow);
     rhi_buffer_destroy(rain_vbo);
     rhi_buffer_destroy(wall_debug_vbo);
     free_headlight_shadows(&headlight_shadows);
+    render_scene_free(&scene_target);free(world_queue.entries);
+    rhi_shader_destroy(world_rp.shader);rhi_shader_destroy(rp.shader);
     clear_car_vinyl();
     tex_override_shutdown();   /* frees the index only; no-op when off */
     rhi_device_destroy(); SDL_DestroyWindow(win); SDL_Quit();

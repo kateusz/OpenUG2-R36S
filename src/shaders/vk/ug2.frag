@@ -164,8 +164,7 @@ void main(){
     oColor=vec4(mix(u.uFogColor,t.rgb*u.uColor,fog),a); return;
   }
   if(u.uUnlit>0.5){ float a=u.uAlpha;
-/* Shadow footprints need a filled rounded rectangle; lamp/neon sprites
-   retain their radial falloff. Both fade to zero at the quad boundary. */
+/* Lamp/neon sprites retain their radial falloff. */
     if(u.uSoft>0.5){
 /* ponytail: transparent lens highlights, no refraction copy. Add image
    distortion only if its measured cost fits the frame budget. */

@@ -2,9 +2,9 @@ OpenUG2 for ArkOS / dArkOS (R36S)
 =================================
 
 DEVICE STATUS (2026-11-04)
-  User confirmed the game runs correctly and responds to actions on a physical
-  R36S with the 500 m load / 450 m draw preset. FPS remains very low.
-  Performance investigation is deferred; no FPS improvement is claimed.
+  Startup and controls are confirmed on physical R36S. The previous build was
+  OOM-killed during sustained driving. This candidate reduces transition memory
+  and AI query work; physical driving acceptance must be repeated.
 
 WHAT THIS IS
   An open-source reimplementation of the Need for Speed Underground 2 engine,
@@ -59,7 +59,7 @@ TROUBLESHOOTING
   If the pad does not respond, run "OpenUG2 Diagnostics" from the Ports menu,
   then copy input-info.log off the SD card.
 
-  The current bring-up config adds --input-monitor 120. In last-run.log:
+  Optional OPENUG2_ARGS="--input-monitor 120" adds the following to last-run.log:
     input-watch:  independent one-second heartbeat (frame/event counts, phase)
     input-sample: raw axes and physical buttons
     input-state:  resolved driving inputs and pause/race/simulation state
@@ -71,3 +71,30 @@ TROUBLESHOOTING
   Runtime evidence is collected outside the engine, so a killed process can
   still leave system-after.log. Kernel messages may be denied by firmware;
   the log records that error. Exit 137 alone identifies SIGKILL, not its cause.
+
+PERFORMANCE LOGGING
+Enabled by default: performance.csv contains per-frame section timings and
+process CPU milliseconds; resource.log includes CPU counters and available
+clock/thermal/GPU sensors. Keep last-run.log and system-before/after.log too.
+Run about 30 seconds stationary then 60-90 seconds driving, exit normally,
+and copy logs before relaunching. See tools/arm64/PERFORMANCE.md in the repo.
+GPU timing can be unavailable; blank GPU columns do not mean zero GPU work.
+
+RENDERING DEFAULTS
+640x480 display and native HUD/menu/UI; a 320x240 3D scene is bilinearly upscaled.
+Vehicle shadows are removed for every car and quality level. Headlight world
+shadows remain: fast = 256x256 / one sample (reference = 512/4, filtered = 256/4).
+Edit OPENUG2_SCENE_RESOLUTION=native or 480x360 for comparisons. D24 support is
+required for scaling; allocation/framebuffer failure logs a native fallback.
+OPENUG2_WORLD_SHADER=legacy and OPENUG2_WORLD_ORDER=legacy remain the safe defaults
+until device comparisons pass; auto/depth explicitly select the candidates.
+
+CONTROLLED PERFORMANCE COMPARISON
+Select "OpenUG2 Performance" in Ports. It runs eight fresh 120-frame cases:
+native reference, 480x360, 320x240, fast headlights, specialized world shader,
+depth order, optimized repeat, native repeat. Each case has isolated logs and a
+complete display screenshot under perf-compare-XXXXXX. Normal-play logs survive.
+The entry writes performance-entry-XXXXXX.log. Exclude the first 20 frames and
+final screenshot frame; over 5% repeat drift invalidates performance attribution.
+See tools/arm64/PERFORMANCE.md in the repository for analysis and acceptance.
+The normal performance capture also writes memory.csv at each loading phase.

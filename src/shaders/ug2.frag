@@ -1,3 +1,9 @@
+#ifndef HEAD_MAP_SIZE
+#define HEAD_MAP_SIZE 512.0
+#endif
+#ifndef HEAD_FAST
+#define HEAD_FAST 0
+#endif
 varying vec2 vUV; varying vec3 vN; varying float vDepth; varying vec3 vPos;
 varying vec4 vColor;
 uniform sampler2D uTex;
@@ -34,19 +40,25 @@ uniform sampler2D uHeadShadowMap0, uHeadShadowMap1;
 uniform mat4 uHeadShadowMVP[2];
 float headVisibility(int h,vec3 position,vec3 normal,float along){
   if(uHeadShadow<0.5)return 1.0;
-  float offset=0.005+along*max(uHeadShape.x,uHeadShape.y)*2.0/512.0;
+  float offset=0.005+along*max(uHeadShape.x,uHeadShape.y)*2.0/HEAD_MAP_SIZE;
   vec4 clip=uHeadShadowMVP[h]*vec4(position+normal*offset,1.0);
   vec2 uv=clip.xy/clip.w*0.5+0.5;
   if(clip.w<=0.0 || uv.x<0.0 || uv.x>1.0 || uv.y<0.0 || uv.y>1.0)return 1.0;
-  float depth=(clip.w-0.025-0.001*along)/uHeadShape.w;
+  float depth=(clip.w-(0.025+0.001*along)*(512.0/HEAD_MAP_SIZE))/uHeadShape.w;
+#if HEAD_FAST
+  vec2 depthRG=h==0?texture2D(uHeadShadowMap0,uv).rg:texture2D(uHeadShadowMap1,uv).rg;
+  return step(depth,dot(depthRG,vec2(1.0,1.0/255.0)));
+#else
   float visibility=0.0;
   for(int x=0;x<2;x++)for(int y=0;y<2;y++){
-    vec2 at=uv+(vec2(float(x),float(y))-0.5)/512.0;
+    vec2 at=uv+(vec2(float(x),float(y))-0.5)/HEAD_MAP_SIZE;
     vec2 depthRG=h==0?texture2D(uHeadShadowMap0,at).rg:texture2D(uHeadShadowMap1,at).rg;
     visibility+=step(depth,dot(depthRG,vec2(1.0,1.0/255.0)))*0.25;
   }
   return visibility;
+#endif
 }
+#ifndef WORLD_ONLY
 float wetHash(vec2 p){return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453);}
 float wetNoise(vec2 p){
   vec2 i=floor(p),f=fract(p); f=f*f*(3.0-2.0*f);
@@ -90,6 +102,7 @@ vec4 roadReflection(vec3 N,vec3 V,float wet,float puddle){
   }
   return vec4(0.0);
 }
+#endif
 /* exp^2 distance fog: fades far batches into the sky colour (which is
    cleared to uFogColor, so the horizon and the haze always agree) */
 void main(){
@@ -99,11 +112,13 @@ void main(){
    regions at a glance) with a darkened 10x10 grid overlaid so uneven
    cell spacing reveals stretching and grid-line direction reveals
    flips/mirrors. Checked first so it overrides every other path. */
+#ifndef WORLD_ONLY
   if(uUVCheck>0.5){
     vec2 g=abs(fract(vUV*10.0-0.5)-0.5);
     float grid=smoothstep(0.0,0.04,min(g.x,g.y));
     gl_FragColor=vec4(vec3(vUV.x,vUV.y,0.2)*mix(0.35,1.0,grid),1.0); return;
   }
+#endif
   float fog = clamp(exp(-pow(vDepth*uFogDensity, 2.0)), 0.0, 1.0);
 /* M132-R2 vista path. The backdrops are authored as cut-out sheets: their
    DXT1 blocks carry one-bit transparency (up to 57.7% of texels fully
@@ -117,6 +132,7 @@ void main(){
    doubled, alpha NOT doubled, no lighting/tint/alpha test, world fog on the
    colour only. Vertex bytes are RGB 128 and alpha 0..127, so out.rgb is the
    texel colour x 256/255 and out.a = texel alpha x vertexAlpha/255. */
+#ifndef WORLD_ONLY
   if(uVista>1.5){
     vec4 t = texture2D(uTex, vUV);
     gl_FragColor = vec4(mix(uFogColor, clamp(2.0*t.rgb*vColor.rgb, 0.0, 1.0), fog), t.a*vColor.a);
@@ -136,8 +152,7 @@ void main(){
     gl_FragColor=vec4(mix(uFogColor,t.rgb*uColor,fog),a); return;
   }
   if(uUnlit>0.5){ float a=uAlpha;
-/* Shadow footprints need a filled rounded rectangle; lamp/neon sprites
-   retain their radial falloff. Both fade to zero at the quad boundary. */
+/* Lamp/neon sprites retain their radial falloff. */
     if(uSoft>0.5){
 /* ponytail: transparent lens highlights, no refraction copy. Add image
    distortion only if its measured cost fits the frame budget. */
@@ -149,17 +164,20 @@ void main(){
         vec3 drop=mix(vec3(0.015,0.025,0.035),vec3(0.85,0.92,1.0),shade);
         gl_FragColor=vec4(drop,vColor.r*uAlpha*(0.04*(1.0-d)+0.26*rim+0.28*glint));return;
       }
-      else if(uSoft>1.5){ float d=length(max(abs(vUV-vec2(0.5))-vec2(0.4),vec2(0.0))); a*=1.0-smoothstep(0.02,0.1,d); }
       else { float d=length(vUV-vec2(0.5)); a*=clamp(1.0-d*2.0,0.0,1.0); } a*=a; }
     gl_FragColor=vec4(mix(uFogColor,uColor,fog),a); return; }
 /* Positions, normals, light and camera share world space. The model
    includes road tilt and each wheel/brake hub's own transform. */
+#endif
   vec3 L=normalize(uLight); vec3 N=normalize(vN);
   if(uFlipN>0.5) N = -N;
   vec3 V=normalize(uCamPos - vPos);
 /* Two-sided glass reflects the viewer-facing side; a backwards normal
    otherwise forces Fresnel to 1 and makes the far window fully opaque. */
+#ifndef WORLD_ONLY
   if(uFresnel>0.5 && dot(N,V)<0.0) N=-N;
+#endif
+#ifndef WORLD_ONLY
 /* Wet asphalt keeps a broad sheen; only sparse, nearly level patches
    collect standing water. Keep the reflection normal steady: unfiltered
    fine rain ripples alias at road distance and jump screen-space hits.
@@ -176,6 +194,7 @@ void main(){
     vec4 reflected=roadReflection(N,V,wet,puddle); reflected.a*=fog;
     gl_FragColor=reflected;return;
   }
+#endif
   float nl=max(dot(N,L),0.0);
   float d=uAmbient+uDiffuse*nl;  /* directional; reveals body form */
 /* uAmbient/uDiffuse are one shared per-frame pair (world+cars both read
@@ -189,7 +208,9 @@ void main(){
    specular, rim and environment terms were even added -- so every panel
    saturated and the highlights had no headroom left to show against.
    Pulling the body's own diffuse back leaves that headroom for them. */
+#ifndef WORLD_ONLY
   if(uSpec>0.001) d=uAmbient*0.35+uDiffuse*0.80*nl;
+#endif
 /* uDecal: paint under an alpha-masked decal atlas (badges/vinyls) --
    texture RGB shows only where its alpha says so, paint elsewhere */
   vec4 t = texture2D(uTex,vUV);
@@ -197,13 +218,19 @@ void main(){
    matches the authored railing/fence texture's own 1-bit DXT1 alpha
    (fully 0 or 255, no partial value to tune against). */
   if(uAlphaTest>0.5 && t.a<0.5) discard;
+#ifdef WORLD_ONLY
+  vec3 base = uUseTex>0.5 ? t.rgb : uColor;
+#else
   vec3 base = uUseTex>0.5 ? (uDecal>0.5 ? mix(uColor,t.rgb,t.a) : t.rgb) : uColor;
+#endif
 /* Rim paint: recolor the diffuse toward uColor while KEEPING its detail.
    Luminance drives the shade, uColor picks the metal, so a gold OEM sheet
    becomes any painted colour (silver by default) with spokes/shadows
    intact. uRimTint 0 = raw OEM texture, 1 = fully painted. */
+#ifndef WORLD_ONLY
   if(uRimTint>0.001){ float y=dot(t.rgb, vec3(0.299,0.587,0.114));
     base = mix(base, uColor*(0.25+1.5*y), uRimTint); }
+#endif
 /* cheap view-angle cavity darkening (cars only, uSpec>0 -- the world
    batches always set uSpec=0): panel gaps/creases have no texture data
    to show them (verified: body meshes carry no diffuse map at all), so
@@ -213,14 +240,19 @@ void main(){
    falloff reached far onto flat panels and fought the fresnel edge
    brightening below, which is what flattened the paint into matte clay.
    It now only bites in the last few degrees, i.e. actual creases. */
+#ifndef WORLD_ONLY
   if(uSpec>0.001){
     float edge=pow(1.0-clamp(dot(N,V),0.0,1.0), 6.0);
     base *= mix(1.0, 0.78, edge);
   }
+#endif
 /* Phong: reflect the light about the normal and test it against the VIEW
    vector. The old form used dot(N,L) with no V term at all, so it was a
    sharpened diffuse -- the highlight could not travel across a panel as
    the camera moved, which is what made the paint read flat/matte. */
+#ifdef WORLD_ONLY
+  float sp=0.0,rim=0.0;
+#else
   float rl = max(dot(reflect(-L,N), V), 0.0);
   float sp = pow(rl, uGloss)*uSpec;
 /* clear coat: automotive paint is a coloured base coat under a clear
@@ -232,11 +264,13 @@ void main(){
 /* The city capture supplies the clear-coat shape; the night key light
    must not clip the hood to white and hide those reflected buildings. */
   if(uEnvReady>0.5 && uClearcoat>0.001){sp*=0.30;rim*=0.25;}
+#endif
   vec3 lit = base*d*1.35 + sp + rim;
 /* World prelight uses MODULATE2X (0.5 neutral); textureless vehicle assets
    use the same byte slot as direct diffuse color for windows and trim. */
   if(uVColor>1.5) lit *= vColor.rgb;
   else if(uVColor>0.001) lit *= clamp(vColor.rgb*2.0, 0.0, 1.6);
+#ifndef WORLD_ONLY
   if(wet>0.001){
     lit*=1.0-0.32*wet;
     float wf=0.025+0.975*pow(1.0-max(dot(N,V),0.0),5.0);
@@ -263,6 +297,7 @@ void main(){
       }
     }
   }
+#endif
 /* Surface lighting and per-lamp world-geometry shadows. */
   if(uHeadGain>0.0) for(int h=0;h<2;h++){
     vec3 ray=vPos-uHeadPos[h].xyz; float dist=length(ray);
@@ -276,15 +311,18 @@ void main(){
       float reach=1.0-smoothstep(uHeadShape.w*0.65,uHeadShape.w,dist);
       float lambert=max(dot(N,-ray/max(dist,0.001)),0.0);
       if(edge*cutoff*lambert>0.0)lit+=base*vec3(1.0,0.94,0.82)*edge*cutoff*reach*lambert*uHeadGain*5.0*headVisibility(h,vPos,N,along)/(1.0+dist*dist/350.0);
+#ifndef WORLD_ONLY
       if(wet>0.001 && edge*cutoff>0.0){
         float highlight=pow(max(dot(reflect(ray/max(dist,0.001),N),V),0.0),mix(24.0,100.0,puddle));
         lit+=vec3(1.0,0.94,0.82)*highlight*wet*edge*cutoff*reach*uHeadGain*headVisibility(h,vPos,N,along)/(1.0+dist*dist/350.0);
       }
+#endif
     }
   }
 /* Local scene cube, sampled in world space so reflections stay anchored
    while the body banks. Fresnel adds clear-coat reflection without washing
    the base paint into the old constant warm horizon band. */
+#ifndef WORLD_ONLY
   float fres = 0.18 + 0.82*pow(1.0-clamp(dot(N,V),0.0,1.0), 3.0);
   if(uEnv>0.001){
     vec3 R = reflect(-V, N);
@@ -294,6 +332,9 @@ void main(){
     env=mix(env,textureCube(uEnvCube,R).rgb,local);
     lit=mix(lit,env,clamp(uEnv*fres,0.0,0.85));
   }
+#else
+  float fres=0.0;
+#endif
 /* lit alpha = uAlpha (1 everywhere but the blended glass pass), so
    translucent glass keeps its specular highlight. M135-R: authored
    BLEND/ADD world batches and blended wheels multiply in the TEXTURE's own alpha
@@ -307,6 +348,7 @@ void main(){
    curved lens is hottest where its surface faces the camera and falls off
    toward the rim, which is the difference between a lens and a sticker.
    The 0.55 floor keeps the lamp clearly lit all over. */
+#ifndef WORLD_ONLY
   if(dot(uEmissive,uEmissive)>0.0) lit += uEmissive*(0.55+0.45*clamp(dot(N,V),0.0,1.0));
   float outA = uTextureAlpha>0.5 ? t.a*uAlpha : uAlpha;
 /* Glass (uFresnel, the car glass pass only). A flat per-pass alpha is what
@@ -315,5 +357,8 @@ void main(){
    than a pane. Real glass is nearly clear head-on and a mirror at grazing
    incidence, so alpha rides the same fresnel term the reflection does. */
   if(uFresnel>0.5) outA = clamp(mix(uAlpha, 1.0, fres), 0.0, 1.0);
+#else
+  float outA=uAlpha;
+#endif
   gl_FragColor=vec4(mix(uFogColor, lit, fog), outA);
 }

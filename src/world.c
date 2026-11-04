@@ -212,16 +212,20 @@ void world_neighborhood_free(WorldNeighborhood *neighborhood) {
     world_scene_free(&neighborhood->vista);
     for (int i = 0; i < WORLD_MAXREG; i++) {
         free(neighborhood->rgn[i].tpk.blk);
-        free(neighborhood->rgn[i].data);
+        if (neighborhood->rgn[i].mapped)
+            res_unmap_file(neighborhood->rgn[i].data, neighborhood->rgn[i].len);
+        else free(neighborhood->rgn[i].data);
     }
-    free(neighborhood->loc4);
+    if (neighborhood->loc4_mapped) res_unmap_file(neighborhood->loc4, neighborhood->loc4len);
+    else free(neighborhood->loc4);
     free(neighborhood->mastertpk.blk);
     if (neighborhood->master_mapped)
         res_unmap_file(neighborhood->master, neighborhood->masterlen);
     else
         free(neighborhood->master);
     free(neighborhood->commontpk.blk);
-    free(neighborhood->common);
+    if (neighborhood->common_mapped) res_unmap_file(neighborhood->common, neighborhood->commonlen);
+    else free(neighborhood->common);
     free(neighborhood->grass.rgb);
     free(neighborhood->grass.alpha);
     free(neighborhood->grass.dxt);
@@ -428,7 +432,8 @@ static int world_neighborhood_load_facade(World *w, const char *troot,
     w->neighborhood.nreg = nreg;
 
     char loc4p[1024]; snprintf(loc4p, sizeof loc4p, "%s/LOC4DYNTEX.BIN", troot);
-    w->neighborhood.loc4 = n2_read_file(loc4p, &w->neighborhood.loc4len);
+    w->neighborhood.loc4 = res_map_file(loc4p, &w->neighborhood.loc4len);
+    w->neighborhood.loc4_mapped = w->neighborhood.loc4 != NULL;
 
     /* per-region: own TPK keys + shared LOC4 keys pick each mesh's diffuse
        slot; single-region mode also pulls a big "master" neighbour's TPK for
@@ -438,7 +443,10 @@ static int world_neighborhood_load_facade(World *w, const char *troot,
         WRegion *g = &w->neighborhood.rgn[r];
         snprintf(g->name, sizeof g->name, "%s", regs[r]);
         char trackp[1024]; snprintf(trackp, sizeof trackp, "%s/%s.BUN", troot, regs[r]);
-        g->data = n2_read_file(trackp, &g->len);
+        /* Two parsers open this archive during preparation. Read-only mappings
+         * share file pages and allow reclamation under memory pressure. */
+        g->data = res_map_file(trackp, &g->len);
+        g->mapped = g->data != NULL;
         g->mesh0 = g->mesh1 = w->neighborhood.scene.count;
         if (!g->data) { fprintf(stderr, "cannot read %s\n", trackp); continue; }
         {
@@ -605,7 +613,8 @@ static int world_neighborhood_load_facade(World *w, const char *troot,
     char commonp[1024];
     int plen = snprintf(commonp, sizeof commonp, "%s/../GLOBAL/InGameCommon.bun", troot);
     if (plen >= 0 && (size_t)plen < sizeof commonp) {
-        w->neighborhood.common = n2_read_file(commonp, &w->neighborhood.commonlen);
+        w->neighborhood.common = res_map_file(commonp, &w->neighborhood.commonlen);
+        w->neighborhood.common_mapped = w->neighborhood.common != NULL;
         if (w->neighborhood.common) w->neighborhood.commontpk = n2_tpk_open(w->neighborhood.common, w->neighborhood.commonlen);
     }
     if (options) {
@@ -705,9 +714,9 @@ static int world_texture_decode(const World *w, const WRegion *g,
  * The sources a key resolves against (region bundle, LOC4, master, common) are
  * bundle-global and identical for every neighborhood of one process -- a track
  * switch re-execs -- so a key's decoded result cannot change between builds.
- * ponytail: retain one bundle's visited keys until shutdown; add eviction if
- * multi-bundle in-process streaming makes this measured memory cost too large.
- * The cache owns the GL names; residents only borrow them. Any caller that
+ * Each binding holds a reference, including partial candidates. Unreferenced
+ * decoded images are capped at 32 MiB and trimmed before a new preparation.
+ * The cache owns the GL names; residents borrow them until release. Any caller that
  * replaces the underlying archives in-process must call
  * world_texture_cache_clear() first (see tools/world_texture_test.c).
  * Frame-thread only, so it needs no locking: binding is part of the GL half of
@@ -716,12 +725,40 @@ typedef struct {
     uint32_t key;
     RhiTexture tex;
     unsigned char mode;
-    unsigned char state;    /* 0 empty, 1 bound, 2 unresolvable */
+    unsigned char state;    /* 0 empty, 1 bound, 2 unresolvable, 3 evicted */
+    unsigned refs;         /* successful binding owners, including partial ones */
+    size_t bytes;          /* decoded RGBA full-mip image estimate, not driver RAM */
     uint32_t build, pass;   /* emitted-in-this-build / tried-against-this-source */
 } WTexCacheEntry;
 static WTexCacheEntry *g_texcache;
 static int g_texcache_cap, g_texcache_used;
 static uint32_t g_texbind_build, g_texbind_pass;
+static size_t g_texcache_idle_bytes;
+
+void world_texture_cache_trim(size_t idle_budget) {
+    for (int i = 0; i < g_texcache_cap && g_texcache_idle_bytes > idle_budget; i++) {
+        WTexCacheEntry *e = &g_texcache[i];
+        if (e->state != 1 || e->refs) continue;
+        rhi_texture_destroy(e->tex);
+        g_texcache_idle_bytes -= e->bytes;
+        e->tex = (RhiTexture){0}; e->bytes = 0;
+        /* Keep the occupied key so linear probing still reaches its siblings. */
+        e->state = 3; e->pass = e->build = 0;
+    }
+}
+
+void world_texture_cache_release(const uint32_t *keys, int count) {
+    if (!keys || !g_texcache_cap) return;
+    for (int i = 0; i < count; i++) {
+        unsigned h = keys[i] & (unsigned)(g_texcache_cap - 1);
+        while (g_texcache[h].state && g_texcache[h].key != keys[i])
+            h = (h + 1) & (unsigned)(g_texcache_cap - 1);
+        WTexCacheEntry *e = &g_texcache[h];
+        if (e->state == 1 && e->refs && !--e->refs)
+            g_texcache_idle_bytes += e->bytes;
+    }
+    world_texture_cache_trim(32u * 1024u * 1024u);
+}
 
 /* Slot for `key`: an occupied entry, or the empty slot it belongs in.
  * NULL only if the table cannot grow -- fail the candidate, never create an
@@ -753,6 +790,7 @@ void world_texture_cache_clear(void) {
     free(g_texcache);
     g_texcache = NULL; g_texcache_cap = g_texcache_used = 0;
     g_texbind_build = g_texbind_pass = 0;
+    g_texcache_idle_bytes = 0;
 }
 
 /* Bind one requested key from one source, honouring the cache. `last` marks
@@ -770,9 +808,12 @@ static int world_bind_key(World *w, const WRegion *g, uint32_t tk, int pass,
     if (!e) { *n = -1; return 0; }
     if (e && e->state == 1) {                   /* decoded by an earlier build */
         if (e->build == binding->build) return 0;            /* already emitted */
+        if (!e->refs) g_texcache_idle_bytes -= e->bytes;
+        e->refs++;
         keys[*n] = tk; texs[*n] = e->tex;
         if (modes) modes[*n] = e->mode;
         (*n)++;
+        binding->acquired++;
         e->build = binding->build;
         return 0;
     }
@@ -795,9 +836,17 @@ static int world_bind_key(World *w, const WRegion *g, uint32_t tk, int pass,
         keys[*n] = tk; texs[*n] = id;
         if (modes) modes[*n] = mode;
         (*n)++;
+        binding->acquired++;
         if (e) {
             if (!e->state) g_texcache_used++;
             e->state = 1; e->tex = id; e->mode = mode; e->build = binding->build;
+            e->refs = 1;
+            e->bytes = 0;
+            for (int width=tt.w,height=tt.h;width>0 && height>0;) {
+                e->bytes += (size_t)width * (size_t)height * 4u;
+                if (width==1 && height==1) break;
+                width=width>1?width/2:1;height=height>1?height/2:1;
+            }
         }
     } else {
         if (owner && g_world_texaudit && (ok || pass || !w->neighborhood.common)) {
@@ -865,11 +914,22 @@ int world_bind_textures_step(World *w, uint32_t *keys, RhiTexture *texs,
 done:
     /* Keep every region alive until the last shared-fallback decision. */
     for (int r = 0; r < w->neighborhood.nreg; r++) {
-        free(w->neighborhood.rgn[r].data); w->neighborhood.rgn[r].data = NULL;
+        WRegion *g = &w->neighborhood.rgn[r];
+        if (g->mapped) res_unmap_file(g->data, g->len);
+        else free(g->data);
+        g->data = NULL; g->len = 0; g->mapped = 0;
     }
     free(w->neighborhood.commontpk.blk); memset(&w->neighborhood.commontpk, 0, sizeof w->neighborhood.commontpk);
-    free(w->neighborhood.common); w->neighborhood.common = NULL; w->neighborhood.commonlen = 0;
+    if (w->neighborhood.common_mapped) res_unmap_file(w->neighborhood.common, w->neighborhood.commonlen);
+    else free(w->neighborhood.common);
+    w->neighborhood.common = NULL; w->neighborhood.commonlen = 0; w->neighborhood.common_mapped = 0;
     binding->pass = 2;
+    if (getenv("OPENUG2_MEMORY_LOG")) {
+        size_t texture_bytes=0;
+        for(int i=0;i<g_texcache_cap;i++)if(g_texcache[i].state==1)texture_bytes+=g_texcache[i].bytes;
+        res_memory_log("textures.ready",res_scene_bytes(&w->neighborhood.scene)+
+                       res_scene_bytes(&w->neighborhood.vista),0,texture_bytes);
+    }
     return binding->count < 0 ? -1 : 1;
 }
 
@@ -943,6 +1003,7 @@ void world_ground_grid_free(WGroundGrid *grid) {
     free(grid->start);
     free(grid->list);
     free(grid->bounds);
+    free(grid->block_start); free(grid->block_bounds);
     memset(grid, 0, sizeof *grid);
 }
 
@@ -1014,6 +1075,43 @@ int world_ground_grid_build(WGroundGrid *grid, const N2Scene *scene,
     }
 
     next.meshes = scene->meshes;next.mesh_count=scene->count;
+    /* AI repeatedly probes the same road/terrain meshes. Reject groups of
+     * triangles before recomputing their individual bounds, retaining source
+     * order and the exact existing barycentric/layer-selection arithmetic.
+     * Optional acceleration: allocation failure keeps the linear query path. */
+    size_t blocks = 0;
+    for (int i=0;i<scene->count;i++) {
+        const N2Mesh *m=&scene->meshes[i];
+        if (!m->prop_id && (m->cat==N2_ROAD || m->cat==N2_TERRAIN))
+            blocks += ((size_t)m->nidx / 3 + 15) / 16;
+    }
+    if (blocks && blocks <= INT_MAX && blocks <= SIZE_MAX / sizeof *next.block_bounds) {
+        next.block_start=calloc((size_t)scene->count+1,sizeof *next.block_start);
+        next.block_bounds=malloc(blocks*sizeof *next.block_bounds);
+        if (!next.block_start || !next.block_bounds) {
+            free(next.block_start);free(next.block_bounds);
+            next.block_start=NULL;next.block_bounds=NULL;
+        } else {
+            int at=0;
+            for (int i=0;i<scene->count;i++) {
+                const N2Mesh *m=&scene->meshes[i];next.block_start[i]=at;
+                if (m->prop_id || (m->cat!=N2_ROAD && m->cat!=N2_TERRAIN))continue;
+                for(int t=0;t+2<m->nidx;t+=48) {
+                    float *box=next.block_bounds[at++];
+                    box[0]=box[1]=INFINITY;box[2]=box[3]=-INFINITY;
+                    for(int q=t;q<t+48 && q+2<m->nidx;q+=3) {
+                        const float *a=m->verts+5*m->idx[q],*b=m->verts+5*m->idx[q+1],*c=m->verts+5*m->idx[q+2];
+                        float x0=fminf(a[0],fminf(b[0],c[0])),x1=fmaxf(a[0],fmaxf(b[0],c[0]));
+                        float y0=fminf(a[1],fminf(b[1],c[1])),y1=fmaxf(a[1],fmaxf(b[1],c[1]));
+                        float mx=.05f*(x1-x0)+.01f,my=.05f*(y1-y0)+.01f;
+                        box[0]=fminf(box[0],x0-mx);box[2]=fmaxf(box[2],x1+mx);
+                        box[1]=fminf(box[1],y0-my);box[3]=fmaxf(box[3],y1+my);
+                    }
+                }
+            }
+            next.block_start[scene->count]=at;
+        }
+    }
     next.x0 = x0; next.y0 = y0;
     next.gw = gw; next.gh = gh;
     next.start = start; next.list = list;
@@ -1959,6 +2057,16 @@ static int wg_mesh_far(int mesh, float x, float y) {
     float mx=.05f*(b[2]-b[0])+.01f, my=.05f*(b[3]-b[1])+.01f;
     return x<b[0]-mx || x>b[2]+mx || y<b[1]-my || y>b[3]+my;
 }
+static const float (*wg_mesh_blocks(const N2Scene *s,const int *srcmap,int mesh))[4] {
+    if (!g_grid.block_start || !g_grid.block_bounds) return NULL;
+    int id=srcmap?srcmap[mesh]:mesh;
+    if (id<0 || id>=g_grid.mesh_count ||
+        (!srcmap && s->meshes!=g_grid.meshes))return NULL;
+    const N2Mesh *m=&s->meshes[mesh],*active=&g_grid.meshes[id];
+    if (m->verts!=active->verts || m->idx!=active->idx || m->prop_id ||
+        g_grid.block_start[id]==g_grid.block_start[id+1])return NULL;
+    return (const float (*)[4])(g_grid.block_bounds+g_grid.block_start[id]);
+}
 static int wg_pick(const N2Scene *s, const int *srcmap, float x, float y, float refz,
                    float *outz, float outn[3], WGroundHit *hit) {
     float best = 0.0f, bestkey = 1e30f; int found = 0, bestcat = WSURF_NONE;
@@ -1968,7 +2076,12 @@ static int wg_pick(const N2Scene *s, const int *srcmap, float x, float y, float 
         if (mc != N2_ROAD && mc != N2_TERRAIN) continue;
         const N2Mesh *me = &s->meshes[m];
         if (me->ground_disabled) continue;
+        const float (*blocks)[4]=wg_mesh_blocks(s,srcmap,m);
         for (int t = 0; t + 2 < me->nidx; t += 3) {
+            if (blocks && t%48==0) {
+                const float *b=blocks[t/48];
+                if(x<b[0] || x>b[2] || y<b[1] || y>b[3]) {t+=45;continue;}
+            }
             const float *a = me->verts + me->idx[t]*5;
             const float *b = me->verts + me->idx[t+1]*5;
             const float *c = me->verts + me->idx[t+2]*5;
@@ -2111,7 +2224,12 @@ static int wws_pick(const N2Scene *s, const int *srcmap, float x, float y,
         if (mc != N2_ROAD && mc != N2_TERRAIN) continue;
         const N2Mesh *me = &s->meshes[m];
         if (me->ground_disabled) continue;
+        const float (*blocks)[4]=wg_mesh_blocks(s,srcmap,m);
         for (int t = 0; t + 2 < me->nidx; t += 3) {
+            if (blocks && t%48==0) {
+                const float *b=blocks[t/48];
+                if(x<b[0] || x>b[2] || y<b[1] || y>b[3]) {t+=45;continue;}
+            }
             const float *a = me->verts + me->idx[t]*5;
             const float *b = me->verts + me->idx[t+1]*5;
             const float *c = me->verts + me->idx[t+2]*5;

@@ -251,96 +251,6 @@ void render_free_camera(float eye[3],float yaw,float pitch,const float move[3],f
     for(int a=0;a<3;a++)eye[a]+=step*delta[a];
 }
 
-/* Affine projection along the same key-light direction as the lit materials.
- * ponytail: one receiving ground plane per car; a terrain shadow map is needed
- * if silhouettes must wrap stairs or nearby walls instead of the road plane. */
-void mat_ground_shadow(const float ground[3],const float normal[3],float m[16]) {
-    float light[3]={N2_SUN_X,N2_SUN_Y,N2_SUN_Z};
-    float d=0,plane=.025f;
-    for(int a=0;a<3;a++){d+=normal[a]*light[a];plane+=normal[a]*ground[a];}
-    if(d<.15f){for(int a=0;a<3;a++)light[a]=normal[a];d=1;}
-    memset(m,0,16*sizeof *m);m[15]=1;
-    for(int a=0;a<3;a++) {
-        for(int b=0;b<3;b++)m[b*4+a]=(a==b?1:0)-light[a]*normal[b]/d;
-        m[12+a]=light[a]*plane/d;
-    }
-}
-
-void free_car_shadow(CarShadow *s) {
-    rhi_buffer_destroy(s->body);
-    rhi_buffer_destroy(s->wheel);
-    memset(s,0,sizeof *s);
-}
-
-/* Flatten indices once per loaded model, not once per frame/traffic actor.
- * Position-only casters merge material slices into one draw per rigid part. */
-static int shadow_vertices(const N2Scene *car,int stock,const N2Scene *rims,
-                           int wheel,RhiBuffer *buffer,int *vertices) {
-    const N2Scene *source=wheel && rims && rims->count?rims:car;
-    size_t count=0;
-    for(int i=0;i<source->count;i++) {
-        const N2Mesh *m=source->meshes+i;
-        if(wheel) {
-            if(source==car && (stock<0 || m->car_mount!=N2_MOUNT_WHEEL ||
-               m->tierid!=car->meshes[stock].tierid))continue;
-        }else if(m->car_mount!=N2_MOUNT_BODY)continue;
-        count+=(size_t)m->nidx;
-    }
-    if(!count){*vertices=0;return 1;}
-    if(count>INT_MAX || count>SIZE_MAX/(3*sizeof(float)))return 0;
-    float *positions=malloc(count*3*sizeof *positions);if(!positions)return 0;
-    size_t n=0;
-    for(int i=0;i<source->count;i++) {
-        const N2Mesh *m=source->meshes+i;
-        if(wheel) {
-            if(source==car && (stock<0 || m->car_mount!=N2_MOUNT_WHEEL ||
-               m->tierid!=car->meshes[stock].tierid))continue;
-        }else if(m->car_mount!=N2_MOUNT_BODY)continue;
-        for(int j=0;j+2<m->nidx;j+=3) {
-            if(m->idx[j]>=m->nverts || m->idx[j+1]>=m->nverts || m->idx[j+2]>=m->nverts)continue;
-            for(int k=0;k<3;k++){memcpy(positions+n*3,m->verts+m->idx[j+k]*5,3*sizeof(float));n++;}
-        }
-    }
-    *buffer=rhi_buffer_create(&(RhiBufferDesc){RHI_BUFFER_VERTEX, RHI_UPDATE_STATIC, n*3*sizeof *positions, positions});
-    free(positions);*vertices=(int)n;return 1;
-}
-
-int render_car_shadow(const RProg *r,CarShadow *s,const N2Scene *car,const GpuMesh *gpu,
-                      int stock,const N2Scene *rims,const GpuMesh *rim_gpu,
-                      const float model[16],const float wheels[4][16],const float mvp[16],
-                      const float ground[3],const float normal[3],int quality) {
-    if(!car || !car->count || !gpu || quality<=0)return 0;
-    uint32_t body_key=gpu[0].vbo.id,wheel_key=rims && rims->count && rim_gpu?rim_gpu[0].vbo.id:
-                                      stock>=0?gpu[stock].vbo.id:0;
-    if(s->body_key!=body_key || s->wheel_key!=wheel_key) {
-        free_car_shadow(s);
-        if(!shadow_vertices(car,stock,rims,0,&s->body,&s->body_count) ||
-           !shadow_vertices(car,stock,rims,1,&s->wheel,&s->wheel_count)) {
-            free_car_shadow(s);return -1;
-        }
-        s->body_key=body_key;s->wheel_key=wheel_key;
-    }
-    float projection[16],projected[16];mat_ground_shadow(ground,normal,projection);
-    mat_mul(mvp,projection,projected);
-    int draws=0;
-    RhiStateSnapshot saved; rhi_cmd_save_state(&saved);
-    rhi_cmd_bind_pipeline(pipelines_of(r)->effect.car_shadow);
-    r->p->uUnlit = 1;r->p->uSoft = 0;r->p->uUseTex = 0;
-    ug2_vec3(r->p->uColor, 0, 0, 0);r->p->uAlpha = .48f;
-    /* Body and wheel coverage share the stencil reference for this actor. */
-    for(int part=0;part<5;part++) {
-        RhiBuffer buffer=part?s->wheel:s->body;int n=part?s->wheel_count:s->body_count;
-        if(!buffer.id || !n)continue;
-        float matrix[16];mat_mul(projected,part?wheels[part-1]:model,matrix);
-        ug2_copy(r->p->uMVP, matrix, 16);
-        rhi_cmd_bind_vertex_buffer(0,buffer,0);
-        rhi_cmd_draw((uint32_t)n,0);draws++;
-    }
-    r->p->uUnlit = 0;r->p->uAlpha = 1;
-    rhi_cmd_restore_state(&saved);
-    return draws;
-}
-
 void free_car_environment(CarEnvironment *s) {
     rhi_texture_destroy(s->depth);
     for(int t=0;t<2;t++)rhi_texture_destroy(s->cube[t]);
@@ -697,6 +607,7 @@ void free_headlight_shadows(HeadlightShadows *s) {
     memset(s,0,sizeof *s);
 }
 static int headlight_shadow_init(HeadlightShadows *s) {
+    int size=s->size?s->size:512;
     static const char *const attributes[] = { "aPos", "aUV" };
     static const RhiParamLayout *const blocks[] = { &headlight_shadow_layout };
     s->shader=render_shader_create("headlight shadow",
@@ -704,21 +615,23 @@ static int headlight_shadow_init(HeadlightShadows *s) {
         GLSL_FS_HEADER, src_shaders_headlight_shadow_frag, src_shaders_headlight_shadow_frag_len,
         attributes, 2, blocks, 1);
     s->params=(HeadlightShadowParams *)rhi_shader_params(s->shader,0);
-    if(!s->params)return 0;
+    if(!s->params){fprintf(stderr,"headlight init: no shader parameters\n");return 0;}
     const RhiSampler nearest=rhi_sampler_create(&(RhiSamplerDesc){RHI_FILTER_NEAREST,RHI_FILTER_NEAREST,
         RHI_MIP_NONE,RHI_WRAP_CLAMP,RHI_WRAP_CLAMP,1.0f});
     for(int h=0;h<2;h++) {
-        s->map[h]=rhi_texture_create(&(RhiTextureDesc){RHI_TEXTURE_2D,RHI_FORMAT_RGBA8,512,512,
+        s->map[h]=rhi_texture_create(&(RhiTextureDesc){RHI_TEXTURE_2D,RHI_FORMAT_RGBA8,size,size,
             RHI_TEXTURE_SAMPLED|RHI_TEXTURE_COLOR_TARGET});
-        if(!s->map[h].id || rhi_texture_upload(s->map[h],0,0,NULL,0)!=RHI_OK ||
-           rhi_texture_set_sampler(s->map[h],nearest)!=RHI_OK)return 0;
+        RhiResult upload=s->map[h].id?rhi_texture_upload(s->map[h],0,0,NULL,0):RHI_ERR_INVALID;
+        RhiResult sampler=s->map[h].id?rhi_texture_set_sampler(s->map[h],nearest):RHI_ERR_INVALID;
+        if(!s->map[h].id || upload!=RHI_OK || sampler!=RHI_OK){fprintf(stderr,"headlight init: map %d handle=%u upload=%d sampler=%d\n",h,s->map[h].id,upload,sampler);return 0;}
     }
     unsigned char white[]={255,255,255};N2Tex tex={.w=1,.h=1,.rgb=white};s->white=upload_tex(&tex);
-    s->depth=rhi_texture_create(&(RhiTextureDesc){RHI_TEXTURE_2D,RHI_FORMAT_D16,512,512,RHI_TEXTURE_DEPTH_TARGET});
+    s->depth=rhi_texture_create(&(RhiTextureDesc){RHI_TEXTURE_2D,RHI_FORMAT_D16,size,size,RHI_TEXTURE_DEPTH_TARGET});
     /* casters: BatchedVertex, depth test LESS with write, no blend, two-sided */
     RhiPipelineDesc d=world_pipeline_desc(s->shader);
     d.depth_compare=RHI_COMPARE_LESS;
     s->pipeline=rhi_pipeline_create(&d);
+    if(!s->white.id || !s->depth.id || !s->pipeline.id)fprintf(stderr,"headlight init: white=%u depth=%u pipeline=%u\n",s->white.id,s->depth.id,s->pipeline.id);
     return s->white.id && s->depth.id && s->pipeline.id;
 }
 int render_batch_in_view(const N2Batch *b,const float m[16]) {
@@ -761,8 +674,10 @@ int render_headlight_shadows(const RProg *r,HeadlightShadows *s,const N2Batch *b
         mat_persp(2*atanf(shape[1]*1.15f),shape[0]/shape[1],.05f,shape[3],projection);
         mat_mul(projection,view,matrices[h]);
         /* far = white, depth 1 */
-        if(rhi_cmd_begin_pass(&(RhiPassDesc){{s->map[h],0},{s->depth,0},RHI_LOAD_CLEAR,RHI_LOAD_CLEAR,
-                                             {1,1,1,1},1.0f})!=RHI_OK) {
+        RhiResult pass_result=rhi_cmd_begin_pass(&(RhiPassDesc){{s->map[h],0},{s->depth,0},RHI_LOAD_CLEAR,RHI_LOAD_CLEAR,
+                                             {1,1,1,1},1.0f});
+        if(pass_result!=RHI_OK) {
+            fprintf(stderr,"Headlight framebuffer failed (%d), size=%d lamp=%d\n",pass_result,s->size,h);
             free_headlight_shadows(s);s->failed=1;
             fprintf(stderr,"Headlight shadows unavailable; retaining unshadowed beams.\n");
             draws=-1;goto restore;
@@ -831,12 +746,18 @@ void render_model(const RProg *r,const float model[16]) {
 
 static const RhiParamLayout *const ug2_blocks[] = { &ug2_params_layout };
 
-RProg render_program(void) {
+RProg render_program(void) { return render_program_variant(0,0); }
+
+RProg render_program_variant(int shadow_profile,int world_only) {
     static const char *const attributes[] = { "aPos", "aUV", "aNor", "aColor" };
     RProg r;
-    r.shader = render_shader_create("ug2",
+    char fs_header[512];
+    snprintf(fs_header,sizeof fs_header,"%s\n#define HEAD_MAP_SIZE %d.0\n#define HEAD_FAST %d\n%s\n",
+        GLSL_FS_HEADER,shadow_profile==1 || shadow_profile==2?256:512,
+        shadow_profile==2,world_only?"#define WORLD_ONLY 1":"");
+    r.shader = render_shader_create(world_only?"ug2-world":"ug2",
         GLSL_VS_HEADER, src_shaders_ug2_vert, src_shaders_ug2_vert_len,
-        GLSL_FS_HEADER, src_shaders_ug2_frag, src_shaders_ug2_frag_len, attributes, 4,
+        fs_header, src_shaders_ug2_frag, src_shaders_ug2_frag_len, attributes, 4,
         ug2_blocks, 1);
     r.prog = rhi_shader_native_program(r.shader);
     r.p = (UG2Params *)rhi_shader_params(r.shader, 0);
@@ -1188,6 +1109,14 @@ WorldBatchUpload *upload_world_batches_begin(const N2Scene *s,
                           const float (*mbb)[4], const RhiTexture *mtex,
                           RhiTexture texTerr, const char *audit,
                           const unsigned char *mtexmode) {
+    return upload_world_batches_begin_local(s,mbb,mtex,texTerr,audit,mtexmode,NULL,0);
+}
+
+WorldBatchUpload *upload_world_batches_begin_local(const N2Scene *s,
+                          const float (*mbb)[4], const RhiTexture *mtex,
+                          RhiTexture texTerr, const char *audit,
+                          const unsigned char *mtexmode,
+                          const float center[2], float radius) {
     if (!s || s->count < 0 || (s->count && (!s->meshes || !mbb || !mtex)))
         return NULL;
     WorldBatchUpload *j = calloc(1, sizeof *j);
@@ -1219,6 +1148,11 @@ WorldBatchUpload *upload_world_batches_begin(const N2Scene *s,
     for (int i = 0; i < n; i++) {
         const N2Mesh *mesh = &s->meshes[i];
         if (mesh->cat == N2_SKY || mesh->cat == N2_GLOW || mesh->cat == N2_COLLISION) continue;
+        if (center && radius>0 && (mesh->cat==N2_ROAD || mesh->cat==N2_TERRAIN)) {
+            float dx=fmaxf(mbb[i][0]-center[0],fmaxf(0,center[0]-mbb[i][2]));
+            float dy=fmaxf(mbb[i][1]-center[1],fmaxf(0,center[1]-mbb[i][3]));
+            if (dx*dx+dy*dy>radius*radius) continue;
+        }
         RhiTexture tex = mtex[i];
         if (!tex.id && mesh->cat == N2_TERRAIN) tex = texTerr;   /* fallback baked in */
         float cx = (mbb[i][0]+mbb[i][2])*0.5f, cy = (mbb[i][1]+mbb[i][3])*0.5f;
@@ -1513,14 +1447,7 @@ static RhiPipelineDesc effect_pipeline(const RProg *r, int depth_test, RhiPrimit
 }
 
 void render_effect_pipelines(const RProg *r, UG2EffectPipelines *p) {
-    RhiPipelineDesc d = effect_pipeline(r, 1, RHI_PRIMITIVE_TRIANGLES);
-    /* each pixel of an actor's shadow is darkened once: draw where the
-       stencil is still 0 and count it up */
-    d.stencil_test = 1;
-    d.stencil_compare = RHI_COMPARE_EQUAL;
-    d.stencil_ref = 0;
-    d.stencil_pass = RHI_STENCIL_INCR;
-    p->car_shadow = rhi_pipeline_create(&d);
+    RhiPipelineDesc d;
     for (int depth = 0; depth < 2; depth++)
         for (int lines = 0; lines < 2; lines++) {
             d = effect_pipeline(r, depth, lines ? RHI_PRIMITIVE_LINES : RHI_PRIMITIVE_TRIANGLES);
@@ -1905,3 +1832,111 @@ void draw_text(GpuMesh *quad, const RProg *r, const char *s, float x, float y, f
     }
 }
 float text_width(const char *s, float px) { return (float)strlen(s) * 4 * px; }
+
+/* Production scene scaling. The physical main target stays native-sized;
+ * unlike the profiling viewport override this is a real sampled scene target. */
+void render_scene_free(SceneTarget *s) {
+    if(!s)return;
+    rhi_texture_destroy(s->color);rhi_texture_destroy(s->depth);
+    rhi_buffer_destroy(s->vertices);rhi_shader_destroy(s->shader);
+    memset(s,0,sizeof *s);
+}
+int render_scene_begin(SceneTarget *s,int width,int height,const float clear[4]) {
+    if(!s || s->failed)return 0;
+    if(width<=0 || height<=0 || !rhi_caps()->depth24_target)goto fail;
+    if(s->width!=width || s->height!=height) {
+        rhi_texture_destroy(s->color);rhi_texture_destroy(s->depth);
+        s->color=rhi_texture_create(&(RhiTextureDesc){RHI_TEXTURE_2D,RHI_FORMAT_RGBA8,width,height,
+            RHI_TEXTURE_SAMPLED|RHI_TEXTURE_COLOR_TARGET});
+        s->depth=rhi_texture_create(&(RhiTextureDesc){RHI_TEXTURE_2D,RHI_FORMAT_D24,width,height,RHI_TEXTURE_DEPTH_TARGET});
+        if(!s->color.id || !s->depth.id || rhi_texture_upload(s->color,0,0,NULL,0)!=RHI_OK)goto fail;
+        RhiSampler sampler=rhi_sampler_create(&(RhiSamplerDesc){RHI_FILTER_LINEAR,RHI_FILTER_LINEAR,
+            RHI_MIP_NONE,RHI_WRAP_CLAMP,RHI_WRAP_CLAMP,1});
+        if(rhi_texture_set_sampler(s->color,sampler)!=RHI_OK)goto fail;
+        s->width=width;s->height=height;
+    }
+    if(!s->shader.id) {
+        static const RhiParamField fields[]={{"uScene",RHI_PARAM_INT,0,1}};
+        static const RhiParamLayout layout={fields,1,16,"SceneComposite"};
+        static const RhiParamLayout *const blocks[]={&layout};
+        static const char *const attributes[]={"aPos","aUV"};
+        s->shader=render_shader_create("scene composite",GLSL_VS_HEADER,
+            src_shaders_scene_composite_vert,src_shaders_scene_composite_vert_len,
+            GLSL_FS_HEADER,src_shaders_scene_composite_frag,src_shaders_scene_composite_frag_len,
+            attributes,2,blocks,1);
+        int *params=rhi_shader_params(s->shader,0);if(!params)goto fail;*params=0;
+        RhiPipelineDesc d;rhi_pipeline_desc_init(&d);d.shader=s->shader;
+        d.vertex.attribs[0]=(RhiVertexAttrib){0,0,0,RHI_VERTEX_FLOAT2};
+        d.vertex.attribs[1]=(RhiVertexAttrib){1,0,8,RHI_VERTEX_FLOAT2};
+        d.vertex.attrib_count=2;d.vertex.stride[0]=16;
+        d.depth_test=d.depth_write=0;
+        s->pipeline=rhi_pipeline_create(&d);
+        const float vertices[]={-1,-1,0,0, 1,-1,1,0, 1,1,1,1, -1,-1,0,0, 1,1,1,1, -1,1,0,1};
+        s->vertices=rhi_buffer_create(&(RhiBufferDesc){RHI_BUFFER_VERTEX,RHI_UPDATE_STATIC,sizeof vertices,vertices});
+        if(!s->pipeline.id || !s->vertices.id)goto fail;
+    }
+    RhiPassDesc pass={{s->color,0},{s->depth,0},RHI_LOAD_CLEAR,RHI_LOAD_CLEAR,{0},1};
+    memcpy(pass.clear_color,clear,sizeof pass.clear_color);
+    if(rhi_cmd_begin_pass(&pass)!=RHI_OK)goto fail;
+    return 1;
+fail:
+    render_scene_free(s);s->failed=1;
+    fprintf(stderr,"scene scaling unavailable (requires RGBA8/D24); rendering at native resolution\n");
+    return 0;
+}
+void render_scene_composite(SceneTarget *s,const float clear[4]) {
+    rhi_cmd_end_pass();
+    rhi_cmd_clear_main(clear,1);
+    rhi_cmd_bind_pipeline(s->pipeline);rhi_cmd_bind_texture(0,s->color);
+    rhi_cmd_bind_vertex_buffer(0,s->vertices,0);rhi_cmd_draw(6,0);
+}
+
+int render_world_queue_reserve(WorldDrawQueue *q,int capacity) {
+    if(capacity<=q->capacity)return 1;
+    WorldDrawEntry *p=realloc(q->entries,(size_t)capacity*sizeof *p);
+    if(!p){fprintf(stderr,"world queue allocation failed; using original submission order\n");return 0;}
+    q->entries=p;q->capacity=capacity;return 1;
+}
+void render_world_queue_push(WorldDrawQueue *q,const N2Batch *b,int index,const float cam[3]) {
+    float d2=0;
+    for(int a=0;a<3;a++){float d=fmaxf(b->bbox_min[a]-cam[a],fmaxf(cam[a]-b->bbox_max[a],0));d2+=d*d;}
+    q->entries[q->count++]=(WorldDrawEntry){index,(int)(sqrtf(d2)/32.0f),b->tex.id,
+        (unsigned)b->drawmode|((unsigned)b->wettable<<8)};
+}
+static int world_entry_compare(const void *aa,const void *bb) {
+    const WorldDrawEntry *a=aa,*b=bb;
+    if(a->bucket!=b->bucket)return a->bucket<b->bucket?-1:1;
+    if(a->material!=b->material)return a->material<b->material?-1:1;
+    if(a->texture!=b->texture)return a->texture<b->texture?-1:1;
+    return (a->index>b->index)-(a->index<b->index);
+}
+/* In-place heapsort: libc qsort may allocate scratch storage every frame. */
+static void world_sift(WorldDrawEntry *v,int root,int count) {
+    for(;;){int child=root*2+1;if(child>=count)return;
+        if(child+1<count && world_entry_compare(v+child,v+child+1)<0)child++;
+        if(world_entry_compare(v+root,v+child)>=0)return;
+        WorldDrawEntry t=v[root];v[root]=v[child];v[child]=t;root=child;
+    }
+}
+void render_world_queue_sort(WorldDrawQueue *q) {
+    for(int i=q->count/2;i-->0;)world_sift(q->entries,i,q->count);
+    for(int n=q->count;n>1;){WorldDrawEntry t=q->entries[0];q->entries[0]=q->entries[--n];q->entries[n]=t;world_sift(q->entries,0,n);}
+}
+int render_world_batch(const RProg *r,const RProg *world,const UG2WorldPipelines *legacy,
+    const UG2WorldPipelines *fast,const N2Batch *b,float wetness,int requested) {
+    UG2Params *p=r->p;
+    p->uUseTex=b->tex.id?1:0;
+    if(!b->tex.id)ug2_vec3(p->uColor,.28f,.29f,.31f);
+    p->uAlphaTest=b->drawmode==N2_DRAW_CUTOUT?1:0;
+    p->uWetness=b->wettable?wetness:0;
+    int eligible=p->uWetness==0 && p->uUnlit==0 && p->uSpec==0 && p->uDecal==0 &&
+        p->uRimTint==0 && p->uFresnel==0 && p->uClearcoat==0 && p->uEnv==0 &&
+        p->uEmissiveTex==0 && p->uVista==0 && p->uUVCheck==0 && p->uRoadReflection==0 &&
+        p->uTextureAlpha==0 && p->uEmissive[0]==0 && p->uEmissive[1]==0 && p->uEmissive[2]==0 &&
+        (b->drawmode==N2_DRAW_OPAQUE || b->drawmode==N2_DRAW_CUTOUT);
+    if(requested && eligible && world->shader.id) {
+        *world->p=*p;rhi_cmd_bind_pipeline(fast->opaque);
+    } else rhi_cmd_bind_pipeline(legacy->opaque);
+    rhi_cmd_bind_texture(0,b->tex);render_draw_batch(b);
+    return requested && (!eligible || !world->shader.id);
+}

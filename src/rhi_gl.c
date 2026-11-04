@@ -124,6 +124,11 @@ static void query_caps(RhiCaps *c) {
     GLint max_texture = 0;
     glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_texture);
     c->max_texture_size = max_texture;
+#ifdef N2_GLES
+    c->depth24_target = has_extension(ext,"GL_OES_depth24");
+#else
+    c->depth24_target = 1;
+#endif
     memset(&g_timer_gl, 0, sizeof g_timer_gl);
     if (has_extension(ext, "GL_EXT_timer_query")) {
         g_timer_gl.gen = (void (*)(GLsizei, GLuint *))SDL_GL_GetProcAddress("glGenQueries");
@@ -213,6 +218,7 @@ RhiResult rhi_frame_begin(RhiFrameInfo *out) {
     if (!g_rhi.context) return RHI_ERR_INVALID;
     rhi_drawable_size(&g_rhi.frame_w, &g_rhi.frame_h);
     g_rhi.in_frame = 1;
+    gls_reset_frame_stats();
     if (out) {
         out->width = g_rhi.frame_w;
         out->height = g_rhi.frame_h;
@@ -226,6 +232,19 @@ RhiResult rhi_frame_end(void) {
     SDL_GL_SwapWindow(g_rhi.window);
     g_rhi.frame_index++;
     g_rhi.in_frame = 0;
+    return RHI_OK;
+}
+
+RhiResult rhi_profile_finish(void) {
+    if (!g_rhi.context || !g_rhi.in_frame) return RHI_ERR_INVALID;
+    glFinish();
+    return RHI_OK;
+}
+
+RhiResult rhi_profile_main_size(int32_t width, int32_t height) {
+    if (!g_rhi.in_frame || width<=0 || height<=0 ||
+        width>g_rhi.frame_w || height>g_rhi.frame_h) return RHI_ERR_INVALID;
+    g_rhi.frame_w=width;g_rhi.frame_h=height;
     return RHI_OK;
 }
 
@@ -505,9 +524,9 @@ static void work_unit_done(GLint active) {
 
 RhiTexture rhi_texture_create(const RhiTextureDesc *desc) {
     RhiTexture out = {0};
-    int depth = desc && desc->format == RHI_FORMAT_D16;
+    int depth = desc && (desc->format == RHI_FORMAT_D16 || desc->format == RHI_FORMAT_D24);
     if (!desc || (desc->type != RHI_TEXTURE_2D && desc->type != RHI_TEXTURE_CUBE) ||
-        desc->format < RHI_FORMAT_RGB8 || desc->format > RHI_FORMAT_DEPTH ||
+        desc->format < RHI_FORMAT_RGB8 || desc->format > RHI_FORMAT_D24 ||
         desc->width <= 0 || desc->height <= 0 || !desc->usage ||
         (desc->usage & ~(uint32_t)(RHI_TEXTURE_SAMPLED | RHI_TEXTURE_COLOR_TARGET |
                                    RHI_TEXTURE_DEPTH_TARGET | RHI_TEXTURE_COPY_DST)) ||
@@ -519,6 +538,7 @@ RhiTexture rhi_texture_create(const RhiTextureDesc *desc) {
         fprintf(stderr, "rhi: texture_create: invalid description\n");
         return out;
     }
+    if(desc->format==RHI_FORMAT_D24 && !g_rhi.caps.depth24_target)return out;
     RhiSampler sampler = rhi_sampler_create(&k_default_sampler);
     if (!sampler.id) return out;
     uint32_t slot = texture_slot_alloc();
@@ -548,7 +568,7 @@ RhiTexture rhi_texture_create(const RhiTextureDesc *desc) {
     out.id = ((uint32_t)t->generation << RHI_GL_SLOT_BITS) | slot;
     if (depth) {
         glBindRenderbuffer(GL_RENDERBUFFER, name);
-        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT16, desc->width, desc->height);
+        glRenderbufferStorage(GL_RENDERBUFFER, desc->format==RHI_FORMAT_D24?0x81A6:GL_DEPTH_COMPONENT16, desc->width, desc->height);
         if (gl_result() != RHI_OK) {
             fprintf(stderr, "rhi: texture_create: %dx%d depth target could not be allocated\n",
                     (int)desc->width, (int)desc->height);
@@ -1604,4 +1624,8 @@ int rhi_timer_read(RhiTimer timer, uint64_t *ns) {
     g_timer_gl.get_ui64v(name, RHI_GL_QUERY_RESULT, &elapsed);
     *ns = elapsed;
     return 1;
+}
+
+RhiFrameStats rhi_frame_stats(void) {
+    RhiFrameStats s;gls_frame_stats(&s.program_changes,&s.texture_changes,&s.state_changes);return s;
 }

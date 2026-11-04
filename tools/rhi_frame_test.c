@@ -239,6 +239,23 @@ int main(void) {
         assert(!rhi_timer_create().id);
     }
     assert(glGetError()==GL_NO_ERROR);
+    /* A reduced profiling frame must read the same lower-left region it
+     * renders, not the upper-left rectangle of the physical drawable. */
+    assert(rhi_profile_main_size(0,32)==RHI_ERR_INVALID);
+    assert(rhi_profile_main_size(32,32)==RHI_OK);
+    assert(rhi_cmd_clear_main(green,1)==RHI_OK);
+    gls_get_integerv(GL_VIEWPORT,vp);
+    assert(vp[2]==32 && vp[3]==32);
+    glEnable(GL_SCISSOR_TEST);glScissor(0,0,32,32);
+    glClearColor(0,0,1,1);glClear(GL_COLOR_BUFFER_BIT);glDisable(GL_SCISSOR_TEST);
+    assert(rhi_read_pixels(0,0,32,32,RHI_READ_RGB8,px,0)==RHI_OK);
+    for(int i=0;i<32*32;i++)assert(px[i*3]==0 && px[i*3+1]==0 && px[i*3+2]==255);
+    assert(rhi_profile_finish()==RHI_OK);
+    assert(rhi_frame_end()==RHI_OK);
+    assert(rhi_profile_main_size(32,32)==RHI_ERR_INVALID);
+    RhiFrameInfo next_frame;
+    assert(rhi_frame_begin(&next_frame)==RHI_OK);
+    assert(next_frame.width==64 && next_frame.height==64);
     assert(rhi_frame_end()==RHI_OK);
     rhi_device_destroy();SDL_DestroyWindow(window);SDL_Quit();
     printf("rhi_frame_test: PASS (main clear, upload results, texture limit, state snapshots, gpu timer %s)\n",

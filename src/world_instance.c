@@ -6,12 +6,17 @@
 #include <string.h>
 
 #include "nfsu2.h"
+#include "resource.h"
 #include "world_scenery.h"
 
 #define WINST_WORLD_LIMIT 1e8f
 
 typedef struct {
     N2Scene scene;
+    const unsigned char *data; /* lazy source; mapping outlives the library */
+    const uint32_t *keys;
+    long begin, end;
+    int nkeys, category;
     float matrix[16];
     uint32_t name_hash;
     uint32_t model_key;  /* authored 0x134011+0x10; display names may truncate */
@@ -26,6 +31,8 @@ typedef struct {
 typedef struct {
     WInstProto *items;
     int count, cap;
+    int lazy;
+    size_t decoded_bytes, peak_decoded_bytes;
 } WInstLibrary;
 
 /* Kept out of the public header: the standalone regression uses this to prove
@@ -243,7 +250,10 @@ static const WInstProto *winst_library_resolve(const WInstLibrary *library,
  * prototype for a requested asset. */
 static int winst_proto_has_own_matrix(const WInstLibrary *library,
                                       const WInstProto *proto) {
-    if (!library || !proto || !proto->has_matrix || proto->scene.count <= 0)
+    if (!library || !proto || !proto->has_matrix ||
+        (!proto->data && proto->scene.count <= 0))
+        return 0;
+    if (proto->data && proto->category != N2_ROAD && proto->category != N2_TERRAIN)
         return 0;
     for (int mesh = 0; mesh < proto->scene.count; mesh++) {
         int cat = proto->scene.meshes[mesh].cat;
@@ -307,6 +317,26 @@ static void winst_collect_model(WInstLibrary *library, const unsigned char *data
     n2_find_leaves(data, begin, end, 0x00134B01u, vtx, &nv, 64);
     n2_find_leaves(data, begin, end, 0x00134B03u, idx, &ni, 64);
     int pairs = nv < ni ? nv : ni;
+    if (library->lazy) {
+        /* Inventory identity/ownership without retaining the whole bundle's
+         * decoded vertex pools (281 MiB on STREAML4RA). Placements still run
+         * in source order; only their prototype decode becomes demand-driven. */
+        /* Validate one object with the established decoder before admitting
+         * its identity. Otherwise a malformed empty model could wrongly win
+         * over an authored LOD fallback. Release that one temporary immediately. */
+        WInstLibrary validated = {0};
+        if (pairs) winst_collect_model(&validated, data, begin, end, keys, nkeys);
+        size_t temporary = validated.count ? res_scene_bytes(&validated.items[0].scene) : 0;
+        if (temporary > library->peak_decoded_bytes) library->peak_decoded_bytes = temporary;
+        if (validated.count && winst_library_add(library, &local, name, matrix, has_matrix, is_vista)) {
+            WInstProto *p = &library->items[library->count - 1];
+            p->model_key = model_key; p->category = cat;
+            p->data = data; p->begin = begin; p->end = end;
+            p->keys = keys; p->nkeys = nkeys;
+        }
+        winst_library_free(&validated);
+        return;
+    }
 
     /* This deliberately mirrors n2_walk_meshes' verified world-material
      * partition gate. A malformed partition falls through to the
@@ -411,6 +441,28 @@ static void winst_collect_models(WInstLibrary *library, const unsigned char *dat
             winst_collect_models(library, data, payload, object_end, keys, nkeys);
         offset = object_end;
     }
+}
+
+/* At most 16 MiB of reusable prototype geometry plus one just-decoded object.
+ * Copies placed into the destination own their vertices, so eviction cannot
+ * invalidate them. Metadata and source-key lookup remain intact. */
+static int winst_prepare_proto(WInstLibrary *library, const WInstProto *source) {
+    if (!source->data || source->scene.meshes) return 1;
+    WInstProto *p = &library->items[source - library->items];
+    if (library->decoded_bytes >= 16u * 1024u * 1024u) {
+        for (int i=0;i<library->count;i++) winst_free_scene(&library->items[i].scene);
+        library->decoded_bytes = 0;
+    }
+    WInstLibrary decoded = {0};
+    winst_collect_model(&decoded, p->data, p->begin, p->end, p->keys, p->nkeys);
+    if (decoded.count != 1) { winst_library_free(&decoded); return 0; }
+    p->scene = decoded.items[0].scene;
+    memset(&decoded.items[0].scene, 0, sizeof decoded.items[0].scene);
+    winst_library_free(&decoded);
+    library->decoded_bytes += res_scene_bytes(&p->scene);
+    if (library->decoded_bytes > library->peak_decoded_bytes)
+        library->peak_decoded_bytes = library->decoded_bytes;
+    return 1;
 }
 
 static int chunk_end(long off, uint32_t size, long limit, long *end) {
@@ -894,7 +946,7 @@ int winst_test_collect_placements(const unsigned char *section_data,
 #endif
 
 typedef struct {
-    const WInstLibrary *library;
+    WInstLibrary *library;
     N2Scene *scene;
     N2Scene *vista;
     WInstStats *stats;
@@ -907,6 +959,7 @@ static int winst_build_visit(const WInstPlacement *placement,
     const WInstProto *proto = winst_library_resolve(build->library, placement,
                                                     type_name, build->stats);
     if (!proto) return 1;
+    if (!winst_prepare_proto(build->library, proto)) return 0;
     N2Scene *dst = proto->is_vista ? build->vista : build->scene;
     uint32_t base_key=proto->model_key;
     for(int lod=0;lod<3;lod++)if(placement->model_keys[lod]) {
@@ -936,6 +989,7 @@ static int winst_build_visit(const WInstPlacement *placement,
 /* winst_collect_model assigns one category to a whole object, so a prototype
  * is ground or it is not. */
 static int winst_proto_is_ground(const WInstProto *proto) {
+    if (proto->data) return proto->category == N2_ROAD || proto->category == N2_TERRAIN;
     for (int i = 0; i < proto->scene.count; i++) {
         int cat = proto->scene.meshes[i].cat;
         if (cat == N2_ROAD || cat == N2_TERRAIN) return 1;
@@ -1013,7 +1067,7 @@ static int winst_mark_instanced(const WInstPlacement *placement,
     return 1;
 }
 
-static int winst_place_ground_prototypes(const WInstLibrary *library,
+static int winst_place_ground_prototypes(WInstLibrary *library,
                                          N2Scene *scene, N2Scene *vista,
                                          WInstStats *stats) {
     static const float identity[16] = {
@@ -1024,7 +1078,9 @@ static int winst_place_ground_prototypes(const WInstLibrary *library,
     for (int i = 0; i < library->count; i++) {
         const WInstProto *proto = &library->items[i];
         if (proto->instanced) continue;
+        if (!winst_proto_is_ground(proto)) continue;
         int own_matrix = winst_proto_has_own_matrix(library, proto);
+        if (!winst_prepare_proto(library, proto)) return 0;
         const float *matrix = own_matrix ? proto->matrix : identity;
         N2Scene *dst = proto->is_vista ? vista : scene;
         for (int mesh = 0; mesh < proto->scene.count; mesh++) {
@@ -1070,7 +1126,7 @@ static unsigned char *winst_read_named(const char *root, const char *name,
     char path[1024];
     snprintf(path, sizeof path, "%s/%s%s", root, name,
              winst_has_suffix(name, ".BUN") ? "" : ".BUN");
-    return n2_read_file(path, len);
+    return res_map_file(path, len);
 }
 
 static int winst_prepare_combined(const N2Scene *dst, const N2Scene *add,
@@ -1150,6 +1206,7 @@ int world_instance_build_for_event(N2Scene *scene, N2Scene *vista,
     WInstRegion *regions = NULL;
     int region_count = 0, region_cap = 0;
     unsigned char *selected = NULL, *bundle_data = NULL;
+    uint32_t *keys = NULL;
     long bundle_len = 0;
     WInstLibrary library;
     N2Scene built_scene, built_vista;
@@ -1182,7 +1239,7 @@ int world_instance_build_for_event(N2Scene *scene, N2Scene *vista,
         int npart = 0;
         int parsed = winst_parse_regions(companion_data, companion_len,
                                          &part, &npart);
-        free(companion_data);
+        res_unmap_file(companion_data, companion_len);
         if (!parsed || !winst_move_regions(&regions, &region_count, &region_cap,
                                            part, npart)) {
             winst_free_regions(part, npart);
@@ -1213,7 +1270,7 @@ int world_instance_build_for_event(N2Scene *scene, N2Scene *vista,
             bundle_data = candidate;
             bundle_len = candidate_len;
             snprintf(local_stats.bundle, sizeof local_stats.bundle, "%s", bundles[i]);
-        } else free(candidate);
+        } else res_unmap_file(candidate, candidate_len);
     }
     /* The home section is the atomic gate: destination scenes are untouched
      * until a complete temporary assembly has been built and committed. */
@@ -1232,7 +1289,7 @@ int world_instance_build_for_event(N2Scene *scene, N2Scene *vista,
         int valid=data && wg_open_file(data,(size_t)len,&table);
         if(valid && !wg_event_group_present(&table,scenery_event))effective_event=0;
         valid=valid && wg_selection_open(&table,effective_event,&scenery);
-        free(data); /* selection owns copied membership, not borrowed bytes */
+        res_unmap_file(data, len); /* selection owns copied membership */
         if(valid) {
             valid=winst_check_scenery(bundle_data,0,bundle_len,0,&scenery);
             for(size_t i=0;i<scenery.count;i++)if(!scenery.items[i].checked)valid=0;
@@ -1244,10 +1301,11 @@ int world_instance_build_for_event(N2Scene *scene, N2Scene *vista,
     }
     local_stats.scenery_effective = effective_event;
 
-    uint32_t *keys = (uint32_t *)malloc(16384 * sizeof *keys);
+    keys = (uint32_t *)malloc(16384 * sizeof *keys);
     if (!keys) goto cleanup;
     N2Tpk tpk = n2_tpk_open(bundle_data, bundle_len);
     int nkeys = n2_tpk_keys(bundle_data, tpk, keys, 16384);
+    free(tpk.blk);
     if (shared && nkeys < 16384)
         nkeys += n2_car_tex_keys(shared, shared_len, keys + nkeys, 16384 - nkeys);
     /* Instance prototypes can reference shared gameplay textures that are
@@ -1260,18 +1318,22 @@ int world_instance_build_for_event(N2Scene *scene, N2Scene *vista,
                               "%s/../GLOBAL/InGameCommon.bun", track_root);
         if (length >= 0 && (size_t)length < sizeof path) {
             long common_len = 0;
-            unsigned char *common = n2_read_file(path, &common_len);
+            unsigned char *common = res_map_file(path, &common_len);
             if (common) {
                 N2Tpk common_tpk = n2_tpk_open(common, common_len);
                 nkeys += n2_tpk_keys(common, common_tpk, keys + nkeys,
                                      16384 - nkeys);
                 free(common_tpk.blk);
-                free(common);
+                res_unmap_file(common, common_len);
             }
         }
     }
+    library.lazy = 1;
     winst_collect_models(&library, bundle_data, 0, bundle_len, keys, nkeys);
-    free(keys);
+    size_t prototype_bytes = 0;
+    for (int i = 0; i < library.count; i++)
+        prototype_bytes += res_scene_bytes(&library.items[i].scene);
+    res_memory_log("instance.prototypes", prototype_bytes, (size_t)bundle_len, 0);
 
     WInstOwnership owner;
     WInstWalk ownership;
@@ -1308,6 +1370,11 @@ int world_instance_build_for_event(N2Scene *scene, N2Scene *vista,
     if (!winst_walk_sections(bundle_data, 0, bundle_len, &collect) ||
         !collect.found_region) goto cleanup;
     if (!winst_commit_scenes(scene, vista, &built_scene, &built_vista)) goto cleanup;
+    res_memory_log("instance.placed", library.decoded_bytes + res_scene_bytes(scene) +
+                   res_scene_bytes(vista), (size_t)bundle_len, 0);
+    if (getenv("OPENUG2_MEMORY_LOG")) fprintf(stderr,
+        "instance prototype cache peak=%zu bytes (16 MiB plus largest object)\n",
+        library.peak_decoded_bytes);
     ok = 1;
 
 cleanup:
@@ -1317,7 +1384,8 @@ cleanup:
         winst_free_scene(&built_vista);
     }
     winst_library_free(&library);
-    free(bundle_data);
+    free(keys);
+    res_unmap_file(bundle_data, bundle_len);
     free(selected);
     winst_free_regions(regions, region_count);
     if (stats) *stats = local_stats;
