@@ -48,6 +48,22 @@ static void open_pad(CxInput *c, int device_index, int slot) {
     p->info.wheel = SDL_JoystickGetType(j) == SDL_JOYSTICK_TYPE_WHEEL;
     memcpy(p->dev.guid, p->guid, 16);
     cb_pad_defaults(&p->dev, &p->info);
+    /* The retail model uses DirectInput slots (Rz = 5); SDL exposes dense
+     * raw indices. A four-axis handheld has no slot 5. Repair only a missing
+     * default, before loading user bindings, keeping wheels/valid axes intact. */
+    if (!p->info.wheel && p->dev.assigned[CB_ROLE_COMBINED] &&
+        !(p->info.axes_mask & (1u << (p->dev.axis[CB_ROLE_COMBINED] / 4)))) {
+        int pedal = -1;
+        if (c->gc[slot]) {
+            SDL_GameControllerButtonBind bind = SDL_GameControllerGetBindForAxis(c->gc[slot], SDL_CONTROLLER_AXIS_RIGHTY);
+            if (bind.bindType == SDL_CONTROLLER_BINDTYPE_AXIS && bind.value.axis < CB_AXIS_COUNT &&
+                (p->info.axes_mask & (1u << bind.value.axis))) pedal = bind.value.axis;
+        }
+        if (pedal < 0 && axes == 4) pedal = 3;   /* unmapped dual-stick SDL layout */
+        if (pedal < 0 && (p->info.axes_mask & (1u << 1))) pedal = 1;
+        if (pedal < 0) p->dev.assigned[CB_ROLE_COMBINED] = 0;
+        else p->dev.axis[CB_ROLE_COMBINED] = 4 * pedal;
+    }
     p->present = 1;
 }
 

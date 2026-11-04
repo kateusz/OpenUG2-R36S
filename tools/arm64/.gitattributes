@@ -1,0 +1,4 @@
+# Shell scripts and the Dockerfile run inside Linux containers; CRLF breaks
+# both the shebang and `set -eu`.
+*.sh text eol=lf
+Dockerfile text eol=lf

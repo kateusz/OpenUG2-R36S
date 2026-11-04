@@ -265,6 +265,39 @@ int main(void) {
     cx_shutdown(c);
     free(c);
     SDL_JoystickDetachVirtual(vi);
+
+    /* R36S: four contiguous SDL axes, seventeen buttons, no POV hats.
+     * The retail DirectInput defaults pick Rz (5), which this pad lacks.
+     * SDL virtual devices share a GUID; isolate the earlier six-axis profile. */
+    setenv("HOME", "build/controls_sdl_four_tmp", 1);
+    vi = SDL_JoystickAttachVirtual(SDL_JOYSTICK_TYPE_GAMECONTROLLER, 4, 17, 0);
+    CHECK(vi >= 0, "attach four-axis handheld pad");
+    if (vi >= 0) {
+        c = (CxInput *)calloc(1, sizeof *c);
+        cx_init(c);
+        vp = find_virtual(c);
+        CHECK(vp >= 0, "find four-axis handheld pad");
+        if (vp >= 0) {
+            for (int i = 0; i < CB_MAX_PADS; i++) if (i != vp) c->b.pad[i].present = 0;
+            d = &c->b.pad[vp].dev;
+            CHECK(d->assigned[CB_ROLE_COMBINED] && d->axis[CB_ROLE_COMBINED] == 12,
+                  "four raw SDL axes: combined pedals use right Y (3), got %d", d->axis[CB_ROLE_COMBINED] / 4);
+            j = c->joy[vp];
+            SDL_JoystickSetVirtualAxis(j, 3, -32768);
+            SDL_JoystickUpdate();
+            CHECK(cx_throttle(c, NULL) > .99f, "right Y up accelerates on four-axis pad");
+            SDL_JoystickSetVirtualAxis(j, 3, 32767);
+            SDL_JoystickUpdate();
+            CHECK(cx_throttle(c, NULL) < -.99f, "right Y down brakes on four-axis pad");
+            SDL_JoystickSetVirtualAxis(j, 3, 0);
+            SDL_JoystickSetVirtualButton(j, 1, 1);
+            SDL_JoystickUpdate();
+            CHECK(cx_throttle(c, NULL) == 1, "A still accelerates on four-axis pad");
+        }
+        cx_shutdown(c);
+        free(c);
+        SDL_JoystickDetachVirtual(vi);
+    }
     SDL_Quit();
     printf("controls_sdl_test: %d checks, %d failed\n", g_checks, g_fail);
     return g_fail ? 1 : 0;

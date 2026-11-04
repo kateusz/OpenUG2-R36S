@@ -1,0 +1,14 @@
+# OpenUG2 pad fallback database (SDL 2.0 GameController format).
+#
+# The launcher prefers the user's own SDL DB and the ArkOS/dArkOS system DB
+# (/opt/inttools/gamecontrollerdb.txt); this file is only the last resort.
+# SDL's built-in database still applies on top of whatever file is loaded.
+#
+# Add a line produced by "OpenUG2 Diagnostics" -> input-info.log (the line
+# after "gamecontrollerdb:") if the R36S pad is not recognised.
+
+# RK3326 handhelds with the single-ADC retrogame_joypad (R36S and siblings).
+190000004b4800000111000000010000,retrogame_joypad,a:b0,b:b1,x:b3,y:b2,back:b8,start:b9,rightstick:b12,leftstick:b11,dpleft:b15,dpdown:b14,dpright:b16,dpup:b13,leftshoulder:b4,lefttrigger:b6,rightshoulder:b5,righttrigger:b7,leftx:a0,lefty:a1,rightx:a2,righty:a3,platform:Linux,
+
+# Measured on this R36S with ArkOS SDL 2.30.3 (input-info.log).
+1900bb3e4b4800000011000000010000,GO-Super Gamepad,x:b2,a:b1,b:b0,y:b3,back:b12,start:b13,dpleft:b10,dpdown:b9,dpright:b11,dpup:b8,leftshoulder:b4,lefttrigger:b6,rightshoulder:b5,righttrigger:b7,leftstick:b14,rightstick:b15,leftx:a0,lefty:a1,rightx:a2,righty:a3,platform:Linux,

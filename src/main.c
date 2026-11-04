@@ -55,6 +55,7 @@
 #include "options_menu.h"
 #include "settings.h"
 #include "controls_sdl.h"
+#include "input_monitor.h"
 #include "ugui/ugui_gl.h"
 #ifdef OPENUG2_MENU
 #include "frontend/frontend.h"
@@ -1010,6 +1011,81 @@ static int dump_car_info(const char *dataroot, const char *car) {
         } else printf("  key=0x%08X  (decode failed)\n", keys[i]);
     }
     free(g); free(t);
+    return 0;
+}
+
+/* --input-info: what SDL sees of the connected pads, in the terms the Controls
+ * screen and gamecontrollerdb.txt need (GUID, vendor/product, axes, buttons,
+ * hats and the GameController mapping line). Device bring-up diagnostic for
+ * handheld ports whose pad SDL does not recognise out of the box; runs right
+ * after SDL init and exits before any data is loaded. */
+static const char *joy_type_name(SDL_JoystickType t) {
+    switch (t) {
+    case SDL_JOYSTICK_TYPE_GAMECONTROLLER: return "gamecontroller";
+    case SDL_JOYSTICK_TYPE_WHEEL:          return "wheel";
+    case SDL_JOYSTICK_TYPE_ARCADE_STICK:   return "arcade-stick";
+    case SDL_JOYSTICK_TYPE_FLIGHT_STICK:   return "flight-stick";
+    case SDL_JOYSTICK_TYPE_DANCE_PAD:      return "dance-pad";
+    case SDL_JOYSTICK_TYPE_GUITAR:         return "guitar";
+    case SDL_JOYSTICK_TYPE_DRUM_KIT:       return "drum-kit";
+    case SDL_JOYSTICK_TYPE_ARCADE_PAD:     return "arcade-pad";
+    case SDL_JOYSTICK_TYPE_THROTTLE:       return "throttle";
+    default:                               return "unknown";
+    }
+}
+
+static int dump_input_info(void) {
+    SDL_version linked;
+    SDL_GetVersion(&linked);
+    printf("input-info: SDL %d.%d.%d\n", linked.major, linked.minor, linked.patch);
+    printf("input-info: video=%s audio=%s\n",
+           SDL_GetCurrentVideoDriver() ? SDL_GetCurrentVideoDriver() : "(none)",
+           SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "(none)");
+    int n = SDL_NumJoysticks();
+    printf("input-info: joysticks=%d\n", n);
+    for (int i = 0; i < n; i++) {
+        const char *name = SDL_JoystickNameForIndex(i);
+        char guid[33];
+        SDL_JoystickGetGUIDString(SDL_JoystickGetDeviceGUID(i), guid, sizeof guid);
+        int is_gc = SDL_IsGameController(i);
+        printf("input-info: [%d] name=\"%s\"\n", i, name ? name : "(unnamed)");
+        printf("input-info: [%d] guid=%s type=%s gamecontroller=%s\n",
+               i, guid, joy_type_name(SDL_JoystickGetDeviceType(i)), is_gc ? "yes" : "no");
+        printf("input-info: [%d] vendor=0x%04x product=0x%04x\n", i,
+               (unsigned)SDL_JoystickGetDeviceVendor(i),
+               (unsigned)SDL_JoystickGetDeviceProduct(i));
+        SDL_Joystick *j = SDL_JoystickOpen(i);
+        if (!j) {
+            printf("input-info: [%d] open failed: %s\n", i, SDL_GetError());
+            continue;
+        }
+        int axes = SDL_JoystickNumAxes(j), buttons = SDL_JoystickNumButtons(j);
+        int hats = SDL_JoystickNumHats(j), balls = SDL_JoystickNumBalls(j);
+        printf("input-info: [%d] axes=%d buttons=%d hats=%d balls=%d\n",
+               i, axes, buttons, hats, balls);
+        printf("input-info: [%d] axis-now", i);
+        for (int a = 0; a < axes; a++) printf(" %d:%d", a, (int)SDL_JoystickGetAxis(j, a));
+        printf("\n");
+        printf("input-info: [%d] button-now", i);
+        for (int b = 0; b < buttons; b++) printf(" %d:%d", b, (int)SDL_JoystickGetButton(j, b));
+        printf("\n");
+        if (is_gc) {
+            SDL_GameController *gc = SDL_GameControllerOpen(i);
+            char *mapping = gc ? SDL_GameControllerMapping(gc) : NULL;
+            if (mapping) {
+                printf("input-info: [%d] mapping=%s\n", i, mapping);
+                printf("input-info: [%d] gamecontrollerdb: %s\n", i, mapping);
+                SDL_free(mapping);
+            } else {
+                printf("input-info: [%d] mapping=(unavailable)\n", i);
+            }
+            if (gc) SDL_GameControllerClose(gc);
+        } else {
+            printf("input-info: [%d] mapping=(none: add a line to gamecontrollerdb.txt)\n", i);
+        }
+        SDL_JoystickClose(j);
+    }
+    printf("input-info: done\n");
     return 0;
 }
 
@@ -2250,6 +2326,8 @@ int main(int argc, char **argv) {
          --pause-off FILE save same-frame frozen scene-only pair before UI
          --pause-reference capture independent populated authored reference with UI replay
          --resolution WxH window/render size (default 1920x1080; also used by audits)
+         --load-radius M  initial world residency radius in metres (default 1400)
+         --view-distance M  drawing distance in metres (default tier-derived)
          --carinfo CAR    dump CAR's part list + texture catalog and exit (GL-free)
          --world2         legacy alias; instance world is automatic for one STREAM
          --scenery-preview free|EVENT  load-time event-only scenery test (world2 capture/audit only)
@@ -2303,6 +2381,9 @@ int main(int argc, char **argv) {
          --collision-walls show current collision wall candidate faces in 3D
          --collision-source legacy|bun select static walls (default: bun)
          --instance-audit print instance/world/support diagnostics and exit GL-free
+         --input-info     list connected pads (name, GUID, axes, buttons, hats,
+                          GameController mapping) and exit
+         --input-monitor SECONDS  log input and independent loop progress for 1..3600 seconds
          --tex-overrides DIR  replace textures with user DDS files from DIR
                           (docs/TEXTURE_OVERRIDES.md); off by default
          --no-tex-overrides  ignore --tex-overrides
@@ -2331,6 +2412,10 @@ int main(int argc, char **argv) {
     /* M132-R diagnostics. tier: 0 = baseline (old fixed 700 m, no vista),
        1 = ordinary (fog-derived range, no vista), 2 = full (range + vista). */
     int tier = 1;   /* production default: ordinary. full is opt-in (M132-R2) */
+    /* Handheld ports load far less of the city up front. Zero keeps the
+       desktop defaults (1400 m residency, tier-derived draw distance). */
+    float load_radius = 0.0f;    /* --load-radius METRES */
+    float view_distance = 0.0f;  /* --view-distance METRES */
     int sky_profile = N2_SKY_NIGHT;
     const char *poseshot = NULL; /* --pose-shot PREFIX: freeze the production
                                     start pose and capture four yaws there */
@@ -2395,6 +2480,9 @@ int main(int argc, char **argv) {
     float vthresh = 3000.0f;   /* --vista-census [METRES]: candidate XY-span floor */
     int rendermode = 0, daylight = 0;   /* --rendermode 0..3 / --daylight: headless F3 matrix */
     int world2 = 1, world2_explicit = 0, instance_audit = 0;
+    int input_info = 0;   /* --input-info: enumerate pads, print GUID/mapping, exit */
+    int input_monitor_seconds = 0;
+    InputMonitor input_monitor = {0};
     int resident_audit = 0;
     const char *resident_route_audit = NULL;
     const char *resident_drive_audit = NULL;  /* M151: physics-driven boundary audit */
@@ -2559,6 +2647,24 @@ int main(int argc, char **argv) {
                            "  full       ordinary + backdrop vistas "
                            "[EXPERIMENTAL: known opaque-sheet artifacts]\n", t);
                    return 2; }
+        }
+        else if (!strcmp(argv[i], "--load-radius") && i+1 < argc) {
+            char *end = NULL;
+            load_radius = strtof(argv[++i], &end);
+            if (!end || *end || !isfinite(load_radius) ||
+                load_radius < 200.0f || load_radius > 5000.0f) {
+                fprintf(stderr, "--load-radius expects metres in 200..5000\n");
+                return 2;
+            }
+        }
+        else if (!strcmp(argv[i], "--view-distance") && i+1 < argc) {
+            char *end = NULL;
+            view_distance = strtof(argv[++i], &end);
+            if (!end || *end || !isfinite(view_distance) ||
+                view_distance < 100.0f || view_distance > 5000.0f) {
+                fprintf(stderr, "--view-distance expects metres in 100..5000\n");
+                return 2;
+            }
         }
         else if (!strcmp(argv[i], "--pose-shot") && i+1 < argc) poseshot = argv[++i];
         else if (!strcmp(argv[i], "--city-pose")) citypose = 1;
@@ -2766,6 +2872,16 @@ int main(int argc, char **argv) {
             }
         }
         else if (!strcmp(argv[i], "--instance-audit")) instance_audit = 1;
+        else if (!strcmp(argv[i], "--input-info")) input_info = 1;
+        else if (!strcmp(argv[i], "--input-monitor")) {
+            char *end = NULL;
+            long seconds = i + 1 < argc ? strtol(argv[++i], &end, 10) : 0;
+            if (!end || *end || seconds < 1 || seconds > 3600) {
+                fprintf(stderr, "--input-monitor requires seconds in 1..3600\n");
+                return 2;
+            }
+            input_monitor_seconds = (int)seconds;
+        }
         else if (!strcmp(argv[i], "--spawn")) {
             if (i+1 >= argc || !strncmp(argv[i+1], "--", 2)) {
                 fprintf(stderr, "missing operand for --spawn (expected start or X,Y)\n");
@@ -2793,6 +2909,19 @@ int main(int argc, char **argv) {
             world2_heading_set = 1;
         }
         else dataroot = argv[i];
+    }
+    if (input_monitor_seconds) setvbuf(stdout, NULL, _IOLBF, BUFSIZ);
+    /* Pad discovery is a bring-up diagnostic: run it before any data access.
+       world_load_ex() below can take minutes on a handheld, and the pad report
+       must not depend on the data being present or complete. */
+    if (input_info) {
+        if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0) {
+            fprintf(stderr, "SDL: %s\n", SDL_GetError());
+            return 1;
+        }
+        int rc = dump_input_info();
+        SDL_Quit();
+        return rc;
     }
     if (chase_d > 0.0f) { g_dbg.chase_distance = chase_d; g_dbg.chase_height = chase_h; }
     /* Closed-circuit loading still uses the verified route/world path. Keep an
@@ -3562,7 +3691,19 @@ int main(int argc, char **argv) {
     unsigned retire_frames = 0, retire_peak_ms = 0, retire_total_ms = 0;
     WResidentBuildTiming candidate_timing = {0};
     unsigned finish_frames = 0, finish_peak_ms = 0, finish_total_ms = 0;
-    const WResidentPolicy resident_policy = {1400.0f, 933.0f, 67.0f, 400.0f};
+    WResidentPolicy resident_policy = {1400.0f, 933.0f, 67.0f, 400.0f};
+    if (load_radius > 0.0f) {
+        /* Scale the whole policy together: world_resident_policy_valid()
+           requires resident >= draw + cell + safety, and the original
+           constants satisfy that exactly. */
+        float s = load_radius / resident_policy.resident_radius;
+        resident_policy.draw_radius    *= s;
+        resident_policy.safety_margin  *= s;
+        resident_policy.cell_size      *= s;
+        resident_policy.resident_radius = resident_policy.draw_radius +
+                                          resident_policy.cell_size +
+                                          resident_policy.safety_margin;
+    }
     if (world2 && !world2_spawn_set) {
         const char *stem = !strncmp(trackname,"STREAM",6) ? trackname+6 : trackname;
         char companion_path[1024], stream_path[1024];
@@ -3598,11 +3739,17 @@ int main(int argc, char **argv) {
         resident_audit ? resident_audit_radius : resident_policy.resident_radius,
         runtime_scenery_event
     };
+    fprintf(stderr, "world: loading %s (radius %.0f m)...\n",
+            trackname, world_options.view_radius);
+    fflush(stderr);
     clock_t resident_cpu_begin = clock();
     int nm = world2 ? world_load_ex(&world, troot, trackname, &world_options)
                     : world_load(&world, troot, trackname);
     double resident_cpu_ms = 1000.0 * (double)(clock() - resident_cpu_begin) /
                              (double)CLOCKS_PER_SEC;
+    fprintf(stderr, "world: loaded %d meshes in %.1f s\n",
+            nm, resident_cpu_ms / 1000.0);
+    fflush(stderr);
     if (world2 && nm <= 0) {
         fprintf(stderr, "open-world load failed for %s at requested focus "
                         "(%.3f, %.3f); exiting before SDL/GL initialization\n",
@@ -3873,7 +4020,9 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) != 0) { fprintf(stderr, "SDL: %s\n", SDL_GetError()); return 1; }
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) != 0) {
+        fprintf(stderr, "SDL: %s\n", SDL_GetError()); return 1;
+    }
 
     /* engine sound, most to least authentic: the car's own Gnsu20 sweep
        recordings (matched by name), else an .abk sample bank (name-hash
@@ -3905,6 +4054,10 @@ int main(int argc, char **argv) {
     if (video_driver && (!strcmp(video_driver, "offscreen") || !strcmp(video_driver, "dummy")))
         window_flags &= ~(uint32_t)SDL_WINDOW_VULKAN;
 #endif
+    fprintf(stderr, "video: opening %dx%d window (driver %s)\n",
+            render_width, render_height,
+            SDL_GetCurrentVideoDriver() ? SDL_GetCurrentVideoDriver() : "auto");
+    fflush(stderr);
     SDL_Window *win = SDL_CreateWindow("OpenUG2",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, render_width, render_height,
         window_flags |
@@ -3920,6 +4073,8 @@ int main(int argc, char **argv) {
       rhi_drawable_size(&dw,&dh);
       printf("render size: requested %dx%d, drawable %dx%d (%s)\n",
              render_width,render_height,dw,dh,capture_window ? "capture" : "interactive");
+      fprintf(stderr, "video: ready\n");
+      fflush(stderr);
       if (capture_window && (dw!=render_width || dh!=render_height ||
                              dw>limit[0] || dh>limit[1])) {
           fprintf(stderr,"Cannot capture the requested resolution on this display/GL backend\n");
@@ -3931,6 +4086,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < SDL_NumJoysticks() && !controller; i++)
         if (SDL_IsGameController(i)) controller = SDL_GameControllerOpen(i);
     cx_init(&g_cx);                                      /* bindings: retail defaults, then the persisted ones */
+    im_start(&input_monitor, input_monitor_seconds, win, &g_cx);
     if (perf_csv) pf_open(perf_csv);
     /* S3TC lets car/rim TPK textures upload their DXT blocks directly
        (glCompressedTexImage2D) instead of the CPU-decoded RGBA. */
@@ -6493,6 +6649,8 @@ int main(int argc, char **argv) {
      * Display. The renderer does not read them yet: see the re-init hook after pause_menu_update. */
     StGraphics opt_gfx;StGfxCaps opt_caps;StRegStore opt_store;int opt_store_open=0;
     while (running) {
+        if (input_monitor.duration) SDL_AtomicAdd(&input_monitor.frames, 1);
+        im_phase(&input_monitor, IM_WORLD);
         pf_mark(PF_FRAME_TOP);
         uint32_t resident_frame_begin = SDL_GetTicks();
         Uint64 resident_frame_counter = SDL_GetPerformanceCounter();
@@ -6537,7 +6695,9 @@ int main(int argc, char **argv) {
         if(g_dbg.traffic_target>N_TRAFFIC_MAX)g_dbg.traffic_target=N_TRAFFIC_MAX;
         traffic_world.traffic_target=g_dbg.traffic_target;
         SDL_Event e;
+        im_phase(&input_monitor, IM_EVENTS);
         while (SDL_PollEvent(&e)) {
+            if (input_monitor.duration) SDL_AtomicAdd(&input_monitor.events, 1);
             if (e.type == SDL_QUIT) { running = 0; continue; }
             uint32_t pad_edge = cx_joy_edges(&g_cx, &e);   /* every event, so hat state stays current while paused */
             int pause_allowed = 1;
@@ -7540,6 +7700,7 @@ int main(int argc, char **argv) {
             resident_route_pending = 0;
         }
         const Uint8 *ks = SDL_GetKeyboardState(NULL);
+        im_phase(&input_monitor, IM_WORLD);
         /* driving inputs -> Physics module (velocity-vector arcade kinematics:
            throttle along the heading, steering rotates it, tyres scrub the
            sideways component so hard cornering at speed slides/drifts). */
@@ -7713,6 +7874,10 @@ int main(int argc, char **argv) {
         beam_keys=beam_keys && !dbgui_want_keyboard();
         driving_keys=driving_keys && !(g_devui && dbgui_want_text());
 #endif
+        im_phase(&input_monitor, IM_INPUT);
+        im_sample(&input_monitor, &g_cx, ks, race_state, driving_keys, pause_frame,
+                  sim_steps, g_ride_ready, speed);
+        im_phase(&input_monitor, IM_SIMULATION);
         int beam_high=g_dbg.headlight_mode==1 || (beam_keys && ks[SDL_SCANCODE_L] && !cx_key_bound(&g_cx,SDL_SCANCODE_L));
         int beam_flash=beam_keys && ks[SDL_SCANCODE_J] && !cx_key_bound(&g_cx,SDL_SCANCODE_J);
         int headlights_on=(g_dbg.night_mode && (g_dbg.headlight_mode!=2 || beam_high)) || beam_flash;
@@ -9079,6 +9244,7 @@ int main(int argc, char **argv) {
 
 
         RhiFrameInfo frame;
+        im_phase(&input_monitor, IM_RENDER);
         RhiResult frame_result = rhi_frame_begin(&frame);
         if (frame_result == RHI_ERR_SKIP_FRAME) {
             /* minimised or zero-sized window: nothing can be presented; keep pumping events */
@@ -9302,7 +9468,8 @@ int main(int argc, char **argv) {
                         ? sqrtf(-logf(VIEW_MINCONTRIB)) / g_dbg.fog_density
                         : zfar;
         if (view_dist > zfar) view_dist = zfar;
-        if (tier == 0) view_dist = 700.0f;      /* --tier baseline: the old gate */
+        if (view_distance > 0.0f) view_dist = view_distance;
+        else if (tier == 0) view_dist = 700.0f; /* --tier baseline: the old gate */
         #define VIEW_DIST view_dist
         int vistadrawn = 0, vistanear = 0;      /* batches */
         int vistamesh = 0, vistanearmesh = 0;   /* their ACTUAL mesh counts */
@@ -12006,7 +12173,9 @@ int main(int argc, char **argv) {
             pause_menu_draw(pause_menu, pw, ph);
         }
         pf_mark(PF_POST_DRAW); pf_gpu(pf_frame,-1);
+        im_phase(&input_monitor, IM_PRESENT);
         rhi_frame_end();
+        im_phase(&input_monitor, IM_IDLE);
         pf_mark(PF_SWAP);
         if (pf_csv) {
             int pf_vis=0;
@@ -12099,6 +12268,7 @@ int main(int argc, char **argv) {
 #ifdef OPENUG2_MENU
     fed_free(frontend_draw);
 #endif
+    im_stop(&input_monitor);
     cx_shutdown(&g_cx);
     if (controller) SDL_GameControllerClose(controller);
     world_texture_cache_clear();

@@ -58,6 +58,7 @@ HDRS += src/drive_trace.h src/drive_presentation.h src/drive_session.h
 SRC += src/hud_race.c
 HDRS += src/hud_race.h src/dir_scan.h
 HDRS += src/player_motion.h
+HDRS += src/input_monitor.h
 
 hud-race-test: tools/hud_race_test.c src/hud_race.c src/hud_race.h src/hud.h src/hud_asset.c src/hud_asset.h src/ugui/ugui_codec.c
 	@mkdir -p build
@@ -559,6 +560,12 @@ controls-test: build/controls_test build/controls_sdl_test
 	./build/controls_test "$(CONTROLS_SPEC)/test-vectors/controls"
 	SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1 ./build/controls_sdl_test
 .PHONY: controls-test
+
+input-monitor-test: tools/input_monitor_test.c src/input_monitor.h $(CONTROLS_SRC) $(CONTROLS_HDR) src/controls_sdl.c src/settings.c
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(SDL_CFLAGS) -Isrc tools/input_monitor_test.c src/controls_sdl.c $(CONTROLS_SRC) src/settings.c -o build/input_monitor_test $(SETTINGS_LIBS) $(SDL_LIBS) -lm
+	./build/input_monitor_test
+.PHONY: input-monitor-test
 
 
 # Every frontend screen in a hidden 16:9 window: menu area drawn, side bars

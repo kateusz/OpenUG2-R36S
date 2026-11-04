@@ -1,0 +1,38 @@
+# OpenUG2 - R36S launcher options.
+# Sourced by OpenUG2.sh, so keep it valid shell (no spaces around =).
+
+# Screen mode. The handheld's SDL video driver owns the display mode; this sets
+# the internal render resolution.
+OPENUG2_RESOLUTION=640x480
+
+# Optional SDL driver overrides. Leave commented for auto-detect.
+#OPENUG2_VIDEODRIVER=kmsdrm
+#OPENUG2_AUDIODRIVER=alsa
+
+# Detail tier: baseline (lowest, fixed 700 m view), ordinary, full.
+OPENUG2_TIER=baseline
+
+# World streaming. Lower = faster load and less RAM; raise if the view looks
+# empty at the horizon. Reduced after the 700 m device run ended in SIGKILL.
+# This reduces memory pressure; resource.log/kernel snapshots check the cause.
+OPENUG2_LOAD_RADIUS=500
+OPENUG2_VIEW_DISTANCE=450
+
+# low / medium / high
+OPENUG2_VEHICLE_QUALITY=low
+OPENUG2_WEATHER_QUALITY=low
+
+# Anisotropic texture filtering: 1 = off (fastest), 2..16 = quality.
+OPENUG2_TEXTURE_DETAIL=2
+
+# HUD aspect fit: 4:3 or wide.
+OPENUG2_HUD_FIT=4:3
+
+# Extra command line arguments, e.g.:
+#   OPENUG2_ARGS="--car SKYLINE --track STREAML4RA"
+# Temporary bring-up trace: 120 seconds of input and loop progress in last-run.log.
+# Remove --input-monitor once handheld input/rendering has been verified.
+OPENUG2_ARGS="--input-monitor 120"
+
+# Capture process/system memory and kernel messages around an unexpected kill.
+OPENUG2_RESOURCE_MONITOR=1

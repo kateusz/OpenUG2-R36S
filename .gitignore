@@ -20,6 +20,7 @@ server.cfg
 SafeMode.bat
 
 # --- Build output ---
+/dist/
 nfsu2
 race-log-*.csv
 build/
